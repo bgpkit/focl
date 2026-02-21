@@ -1,0 +1,44 @@
+[global]
+asn = 65001
+router_id = "192.0.2.1"
+listen = true
+listen_addr = "0.0.0.0:179"
+control_socket = "/tmp/focld.sock"
+log_level = "info"
+
+[[peers]]
+name = "peer-1"
+address = "198.51.100.2"
+remote_as = 65002
+
+[[prefixes]]
+network = "203.0.113.0/24"
+
+[archive]
+enabled = true
+collector_id = "focl01"
+layout_profile = "routeviews"
+updates_interval_secs = 900
+ribs_interval_secs = 7200
+compression = "gzip"
+root = "/tmp/focld-archive"
+tmp_root = "/tmp/focld-archive/.tmp"
+fsync_on_rotate = true
+include_peer_state_records = true
+rib_source = "adj_rib_in"
+
+[[archive.destinations]]
+type = "local"
+mode = "primary"
+path = "/tmp/focld-archive"
+required = true
+
+# [[archive.destinations]]
+# type = "s3"
+# mode = "async_replica"
+# endpoint = "https://s3.us-east-1.amazonaws.com"
+# bucket = "bgp-archive"
+# prefix = "collector=focl01/"
+# upload_concurrency = 4
+# retry_backoff_secs = 5
+# max_retries = 0

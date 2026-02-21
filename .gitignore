@@ -1,1 +1,6 @@
 .DS_Store
+target/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.archive/
