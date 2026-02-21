@@ -4,3 +4,5 @@ target/
 *.sqlite-shm
 *.sqlite-wal
 .archive/
+scripts/interop/.runtime/
+focld-interop.sock

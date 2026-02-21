@@ -40,12 +40,26 @@ impl FoclConfig {
             if peer.remote_as == 0 {
                 bail!("peer {} has invalid remote_as 0", peer.address);
             }
+            if peer.remote_port == 0 {
+                bail!("peer {} has invalid remote_port 0", peer.address);
+            }
             if peer.hold_time_secs != 0 && peer.hold_time_secs < 3 {
                 bail!(
                     "peer {} has invalid hold_time_secs {}; must be 0 or >=3",
                     peer.address,
                     peer.hold_time_secs
                 );
+            }
+            if let Some(local) = &peer.local_address {
+                let ok = local.parse::<std::net::SocketAddr>().is_ok()
+                    || local.parse::<std::net::IpAddr>().is_ok();
+                if !ok {
+                    bail!(
+                        "peer {} has invalid local_address {}; expected IP or socket address",
+                        peer.address,
+                        local
+                    );
+                }
             }
         }
 
@@ -101,6 +115,10 @@ pub struct PeerConfig {
     pub hold_time_secs: u16,
     #[serde(default = "default_connect_retry")]
     pub connect_retry_secs: u16,
+    #[serde(default = "default_remote_port")]
+    pub remote_port: u16,
+    #[serde(default)]
+    pub local_address: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -121,6 +139,10 @@ fn default_hold_time() -> u16 {
 
 fn default_connect_retry() -> u16 {
     5
+}
+
+fn default_remote_port() -> u16 {
+    179
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

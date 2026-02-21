@@ -5,8 +5,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use focl::archive::types::ArchiveStream;
 use focl::archive::ArchiveService;
+use focl::bgp::BgpService;
 use focl::config::FoclConfig;
-use focl::control::{ArchiveRolloverArgs, ArchiveStatusResult, CommandKind};
+use focl::control::{ArchiveRolloverArgs, ArchiveStatusResult, CommandKind, PeerKeyArgs};
 use focl::types::{ControlRequest, ControlResponse};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -33,6 +34,8 @@ async fn main() -> Result<()> {
         .context("global.router_id must be valid IPv4")?;
 
     let archive = ArchiveService::new(cfg.archive.clone(), collector_bgp_id).await?;
+    let events_tx = archive.event_sender();
+    let bgp = BgpService::new(&cfg, events_tx).await?;
 
     let socket_path = cfg.global.control_socket.clone();
     cleanup_socket(&socket_path)?;
@@ -47,8 +50,9 @@ async fn main() -> Result<()> {
 
     let accept_task = {
         let archive = Arc::clone(&archive);
+        let bgp = bgp.clone();
         let shutdown_tx = shutdown_tx.clone();
-        tokio::spawn(async move { run_control_server(listener, archive, shutdown_tx).await })
+        tokio::spawn(async move { run_control_server(listener, archive, bgp, shutdown_tx).await })
     };
 
     tokio::select! {
@@ -89,15 +93,17 @@ fn cleanup_socket(path: &Path) -> Result<()> {
 async fn run_control_server(
     listener: UnixListener,
     archive: Arc<ArchiveService>,
+    bgp: BgpService,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
     loop {
         let (stream, _addr) = listener.accept().await?;
         let archive = Arc::clone(&archive);
+        let bgp = bgp.clone();
         let shutdown_tx = shutdown_tx.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, archive, shutdown_tx).await {
+            if let Err(err) = handle_client(stream, archive, bgp, shutdown_tx).await {
                 tracing::warn!(error=%err, "control connection failed");
             }
         });
@@ -107,6 +113,7 @@ async fn run_control_server(
 async fn handle_client(
     stream: UnixStream,
     archive: Arc<ArchiveService>,
+    bgp: BgpService,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
@@ -134,12 +141,15 @@ async fn handle_client(
             CommandKind::Ping => ControlResponse::ok(req.id, json!({"pong": true})),
             CommandKind::DaemonStatus => {
                 let status = archive.status().await?;
+                let rib = bgp.rib_summary().await;
                 ControlResponse::ok(
                     req.id,
                     json!({
                         "daemon": "focld",
                         "archive_enabled": status.enabled,
                         "queued_replication_jobs": status.queued_replication_jobs,
+                        "peers_total": rib.peers_total,
+                        "peers_established": rib.peers_established,
                     }),
                 )
             }
@@ -214,6 +224,92 @@ async fn handle_client(
             CommandKind::ArchiveReplicatorRetry => {
                 let count = archive.retry_failed_replications().await?;
                 ControlResponse::ok(req.id, json!({"retried_jobs": count}))
+            }
+            CommandKind::PeerList => {
+                let peers = bgp.peer_list().await;
+                ControlResponse::ok(req.id, json!({"peers": peers}))
+            }
+            CommandKind::PeerShow => {
+                let args = match PeerKeyArgs::from_json(&req.args) {
+                    Ok(args) => args,
+                    Err(err) => {
+                        let response = ControlResponse::err(
+                            req.id,
+                            "invalid_args",
+                            format!("peer_show args error: {err}"),
+                        );
+                        write_response(&mut write_half, &response).await?;
+                        continue;
+                    }
+                };
+                match bgp.peer_show(&args.peer).await {
+                    Some(peer) => ControlResponse::ok(req.id, json!({"peer": peer})),
+                    None => ControlResponse::err(req.id, "peer_not_found", "peer not found"),
+                }
+            }
+            CommandKind::PeerReset => {
+                let args = match PeerKeyArgs::from_json(&req.args) {
+                    Ok(args) => args,
+                    Err(err) => {
+                        let response = ControlResponse::err(
+                            req.id,
+                            "invalid_args",
+                            format!("peer_reset args error: {err}"),
+                        );
+                        write_response(&mut write_half, &response).await?;
+                        continue;
+                    }
+                };
+                match bgp.peer_reset(&args.peer).await {
+                    Ok(()) => ControlResponse::ok(req.id, json!({"reset": true})),
+                    Err(err) => ControlResponse::err(req.id, "peer_reset_failed", err.to_string()),
+                }
+            }
+            CommandKind::RibSummary => {
+                let summary = bgp.rib_summary().await;
+                ControlResponse::ok(req.id, json!({"summary": summary}))
+            }
+            CommandKind::RibIn => {
+                let args = match PeerKeyArgs::from_json(&req.args) {
+                    Ok(args) => args,
+                    Err(err) => {
+                        let response = ControlResponse::err(
+                            req.id,
+                            "invalid_args",
+                            format!("rib_in args error: {err}"),
+                        );
+                        write_response(&mut write_half, &response).await?;
+                        continue;
+                    }
+                };
+                match bgp.rib_in(&args.peer).await {
+                    Ok(prefixes) => ControlResponse::ok(
+                        req.id,
+                        json!({"peer": args.peer, "prefixes": prefixes}),
+                    ),
+                    Err(err) => ControlResponse::err(req.id, "rib_in_failed", err.to_string()),
+                }
+            }
+            CommandKind::RibOut => {
+                let args = match PeerKeyArgs::from_json(&req.args) {
+                    Ok(args) => args,
+                    Err(err) => {
+                        let response = ControlResponse::err(
+                            req.id,
+                            "invalid_args",
+                            format!("rib_out args error: {err}"),
+                        );
+                        write_response(&mut write_half, &response).await?;
+                        continue;
+                    }
+                };
+                match bgp.rib_out(&args.peer).await {
+                    Ok(prefixes) => ControlResponse::ok(
+                        req.id,
+                        json!({"peer": args.peer, "prefixes": prefixes}),
+                    ),
+                    Err(err) => ControlResponse::err(req.id, "rib_out_failed", err.to_string()),
+                }
             }
             CommandKind::Unsupported => {
                 if req.cmd == "events_subscribe" {

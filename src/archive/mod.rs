@@ -87,6 +87,10 @@ impl ArchiveService {
         self.event_tx.subscribe()
     }
 
+    pub fn event_sender(&self) -> broadcast::Sender<EventEnvelope> {
+        self.event_tx.clone()
+    }
+
     pub fn destinations(&self) -> Vec<(String, String, String)> {
         self.cfg
             .destinations

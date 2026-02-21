@@ -26,10 +26,32 @@ enum Commands {
     },
     Stop,
     Reload,
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommands,
+    },
+    Rib {
+        #[command(subcommand)]
+        command: RibCommands,
+    },
     Archive {
         #[command(subcommand)]
         command: ArchiveCommands,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum PeerCommands {
+    List,
+    Show { peer: String },
+    Reset { peer: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum RibCommands {
+    Summary,
+    In { peer: String },
+    Out { peer: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,6 +91,38 @@ async fn main() -> Result<()> {
             let response = send_control_request(&cli.socket, "reload", json!({})).await?;
             print_response(response);
         }
+        Commands::Peer { command } => match command {
+            PeerCommands::List => {
+                let response = send_control_request(&cli.socket, "peer_list", json!({})).await?;
+                print_response(response);
+            }
+            PeerCommands::Show { peer } => {
+                let response =
+                    send_control_request(&cli.socket, "peer_show", json!({"peer": peer})).await?;
+                print_response(response);
+            }
+            PeerCommands::Reset { peer } => {
+                let response =
+                    send_control_request(&cli.socket, "peer_reset", json!({"peer": peer})).await?;
+                print_response(response);
+            }
+        },
+        Commands::Rib { command } => match command {
+            RibCommands::Summary => {
+                let response = send_control_request(&cli.socket, "rib_summary", json!({})).await?;
+                print_response(response);
+            }
+            RibCommands::In { peer } => {
+                let response =
+                    send_control_request(&cli.socket, "rib_in", json!({"peer": peer})).await?;
+                print_response(response);
+            }
+            RibCommands::Out { peer } => {
+                let response =
+                    send_control_request(&cli.socket, "rib_out", json!({"peer": peer})).await?;
+                print_response(response);
+            }
+        },
         Commands::Archive { command } => match command {
             ArchiveCommands::Status => {
                 let response =

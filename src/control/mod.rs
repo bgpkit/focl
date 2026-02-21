@@ -9,6 +9,12 @@ pub enum CommandKind {
     DaemonStatus,
     Shutdown,
     Reload,
+    PeerList,
+    PeerShow,
+    PeerReset,
+    RibSummary,
+    RibIn,
+    RibOut,
     ArchiveStatus,
     ArchiveRollover,
     ArchiveSnapshotNow,
@@ -24,6 +30,12 @@ impl CommandKind {
             "daemon_status" => Self::DaemonStatus,
             "shutdown" => Self::Shutdown,
             "reload" => Self::Reload,
+            "peer_list" => Self::PeerList,
+            "peer_show" => Self::PeerShow,
+            "peer_reset" => Self::PeerReset,
+            "rib_summary" => Self::RibSummary,
+            "rib_in" => Self::RibIn,
+            "rib_out" => Self::RibOut,
             "archive_status" => Self::ArchiveStatus,
             "archive_rollover" => Self::ArchiveRollover,
             "archive_snapshot_now" => Self::ArchiveSnapshotNow,
@@ -31,6 +43,17 @@ impl CommandKind {
             "archive_replicator_retry" => Self::ArchiveReplicatorRetry,
             _ => Self::Unsupported,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerKeyArgs {
+    pub peer: String,
+}
+
+impl PeerKeyArgs {
+    pub fn from_json(value: &Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
     }
 }
 

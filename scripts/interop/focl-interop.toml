@@ -1,0 +1,27 @@
+[global]
+asn = 65001
+router_id = "127.0.0.1"
+listen = false
+listen_addr = "0.0.0.0:2179"
+control_socket = "/Users/mingwei/Warehouse/BGPKIT/bgpkit-git/focl/focld-interop.sock"
+log_level = "debug"
+
+[[peers]]
+name = "gobgp-local"
+address = "127.0.0.1"
+remote_as = 65002
+local_as = 65001
+remote_port = 3179
+local_address = "127.0.0.1:0"
+hold_time_secs = 90
+connect_retry_secs = 2
+enabled = true
+passive = false
+route_refresh = true
+
+[[prefixes]]
+network = "203.0.113.0/24"
+next_hop = "127.0.0.1"
+
+[archive]
+enabled = false
