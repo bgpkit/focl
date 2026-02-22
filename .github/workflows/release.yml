@@ -57,6 +57,7 @@ jobs:
         with:
           bin: focl,focld
           target: ${{ matrix.target }}
+          archive: focl-$target
           token: ${{ secrets.GITHUB_TOKEN }}
 
   cargo-publish:
