@@ -1,0 +1,10 @@
+[global.config]
+  as = 65002
+  router-id = "127.0.0.2"
+  port = 3179
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "127.0.0.1"
+    peer-as = 65001
+    auth-password = "testpassword123"

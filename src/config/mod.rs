@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use ipnet::Ipv4Net;
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,8 +64,8 @@ impl FoclConfig {
         }
 
         for prefix in &self.prefixes {
-            prefix.network.parse::<Ipv4Net>().with_context(|| {
-                format!("invalid IPv4 prefix in [[prefixes]]: {}", prefix.network)
+            prefix.network.parse::<IpNet>().with_context(|| {
+                format!("invalid IP prefix in [[prefixes]]: {}", prefix.network)
             })?;
         }
 
@@ -127,6 +127,8 @@ pub struct PeerConfig {
     pub route_refresh: bool,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -234,7 +236,10 @@ impl ArchiveConfig {
             );
         }
 
-        if self.ribs_interval_secs == 0 || self.ribs_interval_secs % self.updates_interval_secs != 0
+        if self.ribs_interval_secs == 0
+            || !self
+                .ribs_interval_secs
+                .is_multiple_of(self.updates_interval_secs)
         {
             bail!(
                 "[archive].ribs_interval_secs must be >0 and a multiple of updates_interval_secs"

@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use bgpkit_parser::bgp::parse_bgp_message;
 use bgpkit_parser::models::{
     AsPath, AsnLength, AttributeValue, Attributes, BgpMessage, BgpOpenMessage, BgpUpdateMessage,
     NetworkPrefix, Origin,
 };
-use bgpkit_parser::bgp::parse_bgp_message;
 use bytes::Bytes;
-use ipnet::{IpNet, Ipv4Net};
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -22,6 +22,9 @@ use tokio::time::{sleep, timeout, Instant};
 use crate::config::{FoclConfig, PeerConfig};
 use crate::types::{Event, EventEnvelope, PeerState};
 
+mod auth;
+use auth::{TcpSocketExt, TcpStreamExt};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub address: String,
@@ -30,6 +33,7 @@ pub struct PeerInfo {
     pub local_as: u32,
     pub remote_port: u16,
     pub passive: bool,
+    pub auth_enabled: bool,
     pub state: PeerState,
     pub last_error: Option<String>,
     pub advertised_prefixes: usize,
@@ -55,10 +59,16 @@ pub struct BgpService {
     inner: Arc<BgpServiceInner>,
 }
 
+#[derive(Debug, Clone)]
+struct PrefixEntry {
+    network: IpNet,
+    next_hop: Option<IpAddr>,
+}
+
 struct BgpServiceInner {
     global_asn: u32,
     router_id: Ipv4Addr,
-    prefixes: Vec<Ipv4Net>,
+    prefixes: Vec<PrefixEntry>,
     peers: RwLock<HashMap<String, PeerRuntime>>,
     event_tx: broadcast::Sender<EventEnvelope>,
 }
@@ -74,7 +84,17 @@ impl BgpService {
         let prefixes = cfg
             .prefixes
             .iter()
-            .map(|p| Ipv4Net::from_str(&p.network))
+            .map(|p| {
+                let network = IpNet::from_str(&p.network)
+                    .with_context(|| format!("invalid prefix network: {}", p.network))?;
+                let next_hop = p
+                    .next_hop
+                    .as_ref()
+                    .map(|nh| nh.parse::<IpAddr>())
+                    .transpose()
+                    .with_context(|| format!("invalid next-hop address: {:?}", p.next_hop))?;
+                Ok::<_, anyhow::Error>(PrefixEntry { network, next_hop })
+            })
             .collect::<Result<Vec<_>, _>>()
             .context("invalid prefix in config")?;
 
@@ -114,6 +134,7 @@ impl BgpService {
             local_as,
             remote_port: peer_cfg.remote_port,
             passive: peer_cfg.passive,
+            auth_enabled: peer_cfg.password.is_some(),
             state: PeerState::Idle,
             last_error: None,
             advertised_prefixes: 0,
@@ -192,7 +213,17 @@ impl BgpService {
             .await
             .with_context(|| format!("failed binding passive listener {listen}"))?;
 
-        let (mut stream, _) = listener.accept().await?;
+        let (mut stream, peer_addr) = listener.accept().await?;
+
+        // Set TCP-MD5 signature if password is configured
+        // Note: For passive mode, the MD5 must be set on the accepted socket
+        // with the specific peer address
+        if let Some(password) = &peer.password {
+            stream
+                .set_md5_signature(&peer_addr, password)
+                .context("failed to set TCP-MD5 signature on accepted connection")?;
+        }
+
         self.run_session(peer, &mut stream).await
     }
 
@@ -275,10 +306,10 @@ impl BgpService {
         stream: &mut TcpStream,
     ) -> Result<()> {
         let local_as = peer.local_as.unwrap_or(self.inner.global_asn);
-        let next_hop = self.inner.router_id;
+        let router_id = self.inner.router_id;
 
-        for prefix in &self.inner.prefixes {
-            let update = build_ipv4_announce_update(*prefix, next_hop, local_as);
+        for prefix_entry in &self.inner.prefixes {
+            let update = build_announce_update(prefix_entry, router_id, local_as);
             write_bgp_message(stream, &update).await?;
         }
 
@@ -378,7 +409,12 @@ impl BgpService {
         if !peers.contains_key(peer) {
             return Err(anyhow!("peer {} not found", peer));
         }
-        Ok(self.inner.prefixes.iter().map(|p| p.to_string()).collect())
+        Ok(self
+            .inner
+            .prefixes
+            .iter()
+            .map(|p| p.network.to_string())
+            .collect())
     }
 
     pub async fn rib_in(&self, peer: &str) -> Result<Vec<String>> {
@@ -400,6 +436,14 @@ async fn connect_with_optional_bind(peer: &PeerConfig, remote: SocketAddr) -> Re
         (SocketAddr::V4(remote_v4), Some(SocketAddr::V4(local_v4))) => {
             let socket = TcpSocket::new_v4()?;
             socket.bind(SocketAddr::V4(local_v4))?;
+
+            // Set TCP-MD5 signature if password is configured
+            if let Some(password) = &peer.password {
+                socket
+                    .set_md5_signature(&remote, password)
+                    .context("failed to set TCP-MD5 signature")?;
+            }
+
             socket
                 .connect(SocketAddr::V4(remote_v4))
                 .await
@@ -412,9 +456,28 @@ async fn connect_with_optional_bind(peer: &PeerConfig, remote: SocketAddr) -> Re
                 TcpSocket::new_v6()?
             };
             socket.bind(local)?;
+
+            // Set TCP-MD5 signature if password is configured
+            if let Some(password) = &peer.password {
+                socket
+                    .set_md5_signature(&remote, password)
+                    .context("failed to set TCP-MD5 signature")?;
+            }
+
             socket.connect(remote).await.map_err(Into::into)
         }
-        (_, None) => TcpStream::connect(remote).await.map_err(Into::into),
+        (_, None) => {
+            // No local bind, set MD5 on connected stream
+            let stream = TcpStream::connect(remote).await?;
+
+            if let Some(password) = &peer.password {
+                stream
+                    .set_md5_signature(&remote, password)
+                    .context("failed to set TCP-MD5 signature")?;
+            }
+
+            Ok(stream)
+        }
     }
 }
 
@@ -476,7 +539,11 @@ async fn read_bgp_message(stream: &mut TcpStream) -> Result<BgpMessage> {
     Ok(parsed)
 }
 
-fn build_ipv4_announce_update(prefix: Ipv4Net, next_hop: Ipv4Addr, local_as: u32) -> BgpMessage {
+fn build_announce_update(
+    prefix_entry: &PrefixEntry,
+    router_id: Ipv4Addr,
+    local_as: u32,
+) -> BgpMessage {
     let mut attrs = Attributes::default();
     attrs.add_attr(AttributeValue::Origin(Origin::IGP).into());
     attrs.add_attr(
@@ -486,9 +553,23 @@ fn build_ipv4_announce_update(prefix: Ipv4Net, next_hop: Ipv4Addr, local_as: u32
         }
         .into(),
     );
-    attrs.add_attr(AttributeValue::NextHop(IpAddr::V4(next_hop)).into());
 
-    let announced = NetworkPrefix::new(IpNet::V4(prefix), None);
+    // Determine next-hop: use configured next-hop or default based on prefix type
+    let next_hop = prefix_entry.next_hop.unwrap_or_else(|| {
+        match prefix_entry.network {
+            IpNet::V4(_) => IpAddr::V4(router_id),
+            IpNet::V6(_) => {
+                // For IPv6, we need a valid IPv6 next-hop
+                // Default to a link-local address derived from router_id if not specified
+                // In practice, user should configure this
+                IpAddr::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))
+            }
+        }
+    });
+
+    attrs.add_attr(AttributeValue::NextHop(next_hop).into());
+
+    let announced = NetworkPrefix::new(prefix_entry.network, None);
     BgpMessage::Update(BgpUpdateMessage {
         withdrawn_prefixes: vec![],
         attributes: attrs,

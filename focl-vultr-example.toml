@@ -1,0 +1,56 @@
+# Example focl configuration with both IPv4 and IPv6 support
+# Uses RFC 5737 documentation IP ranges for examples
+# 
+# Note: This is an EXAMPLE configuration only. Replace with your actual IPs.
+# The password shown below is a FAKE example - use a strong unique password.
+
+[global]
+asn = 65001
+router_id = "192.0.2.1"
+listen = true
+listen_addr = "0.0.0.0:179"
+control_socket = "/tmp/focld.sock"
+log_level = "info"
+
+# IPv4 peer with MD5 authentication
+[[peers]]
+name = "upstream-v4"
+address = "192.0.2.2"
+remote_as = 65002
+remote_port = 179
+local_address = "192.0.2.1:0"
+hold_time_secs = 90
+connect_retry_secs = 5
+enabled = true
+passive = false
+route_refresh = true
+# WARNING: Use a strong unique password in production
+password = "ChangeThisToStrongPassword123!"
+
+# IPv6 peer with MD5 authentication
+[[peers]]
+name = "upstream-v6"
+address = "2001:db8::1"
+remote_as = 65002
+remote_port = 179
+local_address = "2001:db8::2:0"
+hold_time_secs = 90
+connect_retry_secs = 5
+enabled = true
+passive = false
+route_refresh = true
+# WARNING: Use a strong unique password in production
+password = "ChangeThisToStrongPassword123!"
+
+# IPv4 prefixes to announce
+[[prefixes]]
+network = "203.0.113.0/24"
+next_hop = "192.0.2.1"
+
+# IPv6 prefixes to announce
+[[prefixes]]
+network = "2001:db8:1000::/48"
+next_hop = "2001:db8::2"
+
+[archive]
+enabled = false

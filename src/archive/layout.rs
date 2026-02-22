@@ -99,6 +99,7 @@ pub fn segment_paths(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_custom_relative_path(
     template: &str,
     collector: &str,

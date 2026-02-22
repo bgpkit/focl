@@ -1,9 +1,15 @@
 [package]
 name = "focl"
 version = "0.1.0"
+authors = ["Mingwei Zhang <mingwei@bgpkit.com>"]
 edition = "2021"
 license = "MIT"
-description = "focl/focld - lightweight Rust BGP speaker tooling"
+description = "focl/focld - lightweight Rust BGP speaker"
+repository = "https://github.com/bgpkit/focl"
+documentation = "https://docs.rs/focl"
+readme = "README.md"
+keywords = ["bgp", "bgpkit", "routing", "networking"]
+categories = ["network-programming"]
 
 [lib]
 name = "focl"
