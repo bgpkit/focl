@@ -238,7 +238,7 @@ impl BgpService {
             version: 4,
             asn: local_as.into(),
             hold_time,
-            sender_ip: self.inner.router_id,
+            bgp_identifier: self.inner.router_id,
             extended_length: false,
             opt_params: vec![],
         });
@@ -287,7 +287,10 @@ impl BgpService {
             );
             match timeout(timeout_dur, read_bgp_message(stream)).await {
                 Ok(Ok(msg)) => match msg {
-                    BgpMessage::KeepAlive | BgpMessage::Update(_) | BgpMessage::Open(_) => {
+                    BgpMessage::KeepAlive
+                    | BgpMessage::Update(_)
+                    | BgpMessage::Open(_)
+                    | BgpMessage::RouteRefresh(_) => {
                         hold_deadline = Instant::now() + negotiated_hold;
                     }
                     BgpMessage::Notification(_) => {
@@ -493,7 +496,10 @@ fn normalize_socket_addr(raw: &str, default_port: u16) -> Result<SocketAddr> {
 }
 
 async fn write_bgp_message(stream: &mut TcpStream, msg: &BgpMessage) -> Result<()> {
-    let mut bytes = msg.encode(AsnLength::Bits32).to_vec();
+    let mut bytes = msg
+        .encode(AsnLength::Bits32)
+        .map_err(|error| anyhow!("failed encoding BGP message: {error}"))?
+        .to_vec();
     if bytes.len() < 19 {
         return Err(anyhow!("encoded BGP message too short"));
     }

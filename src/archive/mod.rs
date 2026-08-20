@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, Mutex};
 use crate::archive::layout::{aligned_epoch, segment_paths};
 use crate::archive::replicator::Replicator;
 use crate::archive::snapshot::{
-    build_table_dump_v2, encode_bgp4mp_message_as4, encode_bgp4mp_state_change_as4,
+    build_table_dump_v2, encode_bgp4mp_raw_as4, encode_bgp4mp_state_change_as4,
 };
 use crate::archive::types::{
     ArchiveStatus, ArchiveStream, FinalizedSegment, PeerStateRecordInput, RibSnapshotInput,
@@ -116,9 +116,9 @@ impl ArchiveService {
             return Ok(());
         }
 
-        self.ensure_updates_writer(update.timestamp).await?;
-
-        let record = encode_bgp4mp_message_as4(&update)?;
+        // Segment selection is driven exclusively by the ingestion-clock tick.
+        // Event timestamps are preserved in MRT records, never used to reopen buckets.
+        let record = encode_bgp4mp_raw_as4(&update)?;
         let mut writer_guard = self.updates_writer.lock().await;
         let writer = writer_guard
             .as_mut()
@@ -133,8 +133,7 @@ impl ArchiveService {
             return Ok(());
         }
 
-        self.ensure_updates_writer(state.timestamp).await?;
-
+        // State events follow the same ingestion-clock segment discipline as updates.
         let record = encode_bgp4mp_state_change_as4(&state)?;
         let mut writer_guard = self.updates_writer.lock().await;
         let writer = writer_guard
@@ -211,7 +210,11 @@ impl ArchiveService {
                     peers: vec![],
                     routes: vec![],
                 };
-                self.snapshot_now(snapshot).await?;
+                if snapshot.routes.is_empty() {
+                    tracing::debug!("skipping RIB rollover because no baseline routes exist");
+                } else {
+                    self.snapshot_now(snapshot).await?;
+                }
             }
         }
 
@@ -292,8 +295,12 @@ impl ArchiveService {
                 peers: vec![],
                 routes: vec![],
             };
-            self.snapshot_now(snapshot).await?;
-            *last_rib = Some(rib_bucket);
+            if snapshot.routes.is_empty() {
+                tracing::debug!("skipping RIB snapshot because no baseline routes exist");
+            } else {
+                self.snapshot_now(snapshot).await?;
+                *last_rib = Some(rib_bucket);
+            }
         }
 
         Ok(())
@@ -378,4 +385,111 @@ fn cleanup_tmp_root(tmp_root: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io::{Cursor, Read};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use anyhow::{Context, Result};
+    use bgpkit_parser::parse_mrt_record;
+    use chrono::Utc;
+    use flate2::read::GzDecoder;
+
+    use super::*;
+    use crate::archive::types::UpdateRecordInput;
+    use crate::config::ArchiveConfig;
+
+    #[tokio::test]
+    async fn late_and_zero_timestamp_updates_stay_in_current_writer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("archive");
+        let cfg = ArchiveConfig {
+            enabled: true,
+            root: root.clone(),
+            tmp_root: root.join(".tmp"),
+            ..ArchiveConfig::default()
+        };
+        let service = ArchiveService::new(cfg, Ipv4Addr::new(192, 0, 2, 1)).await?;
+        let initial = service
+            .status()
+            .await?
+            .updates_open_path
+            .context("writer should open at service initialization")?;
+
+        let late_timestamp = Utc::now().timestamp() - 7_200;
+        service.ingest_update(test_update(late_timestamp)).await?;
+        service.ingest_update(test_update(0)).await?;
+
+        let status = service.status().await?;
+        assert_eq!(status.updates_open_path, Some(initial));
+        assert_eq!(status.updates_record_count, 2);
+
+        service.rollover(ArchiveStream::Updates).await?;
+        let segment = walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                (entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "gz"))
+                .then(|| entry.path().to_path_buf())
+            })
+            .context("rollover should finalize a gzip updates segment")?;
+        let mut decoded = Vec::new();
+        GzDecoder::new(File::open(segment)?).read_to_end(&mut decoded)?;
+        let mut cursor = Cursor::new(decoded);
+        let first = parse_mrt_record(&mut cursor)?;
+        let second = parse_mrt_record(&mut cursor)?;
+        assert_eq!(first.common_header.timestamp, late_timestamp as u32);
+        assert_eq!(second.common_header.timestamp, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tick_with_no_routes_writes_no_rib_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("archive");
+        let cfg = ArchiveConfig {
+            enabled: true,
+            root: root.clone(),
+            tmp_root: root.join(".tmp"),
+            ..ArchiveConfig::default()
+        };
+        let service = ArchiveService::new(cfg, Ipv4Addr::new(192, 0, 2, 1)).await?;
+        service.tick().await?;
+
+        let status = service.status().await?;
+        assert!(status.ribs_last_path.is_none());
+        assert!(!walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_type().is_file()
+                    && entry.file_name().to_string_lossy().starts_with("rib.")
+            }));
+        Ok(())
+    }
+
+    fn test_update(timestamp: i64) -> UpdateRecordInput {
+        let mut message = vec![0xff; 16];
+        message.extend_from_slice(&24_u16.to_be_bytes());
+        message.push(2);
+        message.extend_from_slice(&1_u16.to_be_bytes());
+        message.push(0);
+        message.extend_from_slice(&0_u16.to_be_bytes());
+        UpdateRecordInput {
+            timestamp,
+            peer_asn: 64_512,
+            local_asn: 64_513,
+            interface_index: 0,
+            peer_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            local_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            bgp_message: message,
+        }
+    }
 }

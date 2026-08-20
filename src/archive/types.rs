@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use crate::config::CompressionKind;
@@ -47,8 +48,9 @@ pub struct UpdateRecordInput {
     pub peer_asn: u32,
     pub local_asn: u32,
     pub interface_index: u16,
-    pub peer_ip: Ipv4Addr,
-    pub local_ip: Ipv4Addr,
+    pub peer_ip: IpAddr,
+    pub local_ip: IpAddr,
+    /// The complete on-the-wire BGP message, including its 19-byte header.
     pub bgp_message: Vec<u8>,
 }
 
@@ -58,8 +60,8 @@ pub struct PeerStateRecordInput {
     pub peer_asn: u32,
     pub local_asn: u32,
     pub interface_index: u16,
-    pub peer_ip: Ipv4Addr,
-    pub local_ip: Ipv4Addr,
+    pub peer_ip: IpAddr,
+    pub local_ip: IpAddr,
     pub old_state: u16,
     pub new_state: u16,
 }
@@ -73,11 +75,10 @@ pub struct SnapshotPeer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotRoute {
-    pub sequence: u32,
-    pub prefix: Ipv4Addr,
-    pub prefix_len: u8,
+    pub prefix: IpNet,
     pub peer_index: u16,
     pub originated_time: u32,
+    pub path_id: Option<u32>,
     pub path_attributes: Vec<u8>,
 }
 
