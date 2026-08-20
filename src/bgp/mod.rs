@@ -84,9 +84,13 @@ struct NegotiatedCapabilities {
 
 impl NegotiatedCapabilities {
     fn supports(&self, afi: Afi, safi: Safi) -> bool {
-        // IPv4 unicast is available to an RFC 4271 peer even if it sent no
-        // RFC 4760 MP capability. IPv6 always requires explicit MP-BGP.
-        (afi == Afi::Ipv4 && safi == Safi::Unicast) || self.families.contains(&(afi, safi))
+        self.families.contains(&(afi, safi))
+    }
+
+    /// True when the peer sent an OPEN with no capabilities at all (plain
+    /// RFC 4271 IPv4-only speaker). IPv4 unicast is then still available.
+    fn plain_ipv4(&self) -> bool {
+        self.families.is_empty()
     }
 }
 
@@ -373,6 +377,36 @@ impl BgpService {
         .await;
         self.send_prefix_announcements(peer, stream, &negotiated)
             .await?;
+        // RFC 4271 End-of-RIB: an empty UPDATE per family marks the initial
+        // table transfer complete. Vultr's route servers treat a session
+        // missing EoR as still converging; send both families' markers.
+        for eor_family in [Afi::Ipv4, Afi::Ipv6] {
+            if negotiated.supports(eor_family, Safi::Unicast) {
+                let eor = if eor_family == Afi::Ipv4 {
+                    BgpMessage::Update(BgpUpdateMessage::default())
+                } else {
+                    let mut attrs = Attributes::default();
+                    attrs.add_attr(
+                        AttributeValue::MpUnreachNlri(Nlri {
+                            afi: Afi::Ipv6,
+                            safi: Safi::Unicast,
+                            next_hop: None,
+                            prefixes: vec![],
+                            labeled_prefixes: None,
+                            link_state_nlris: None,
+                            flowspec_nlris: None,
+                        })
+                        .into(),
+                    );
+                    BgpMessage::Update(BgpUpdateMessage {
+                        withdrawn_prefixes: vec![],
+                        attributes: attrs,
+                        announced_prefixes: vec![],
+                    })
+                };
+                write_bgp_message(stream, &eor, AsnLength::Bits32).await?;
+            }
+        }
 
         let negotiated_hold = Duration::from_secs(hold_time as u64);
         let keepalive_interval = Duration::from_secs((hold_time as u64 / 3).max(1));
@@ -456,13 +490,17 @@ impl BgpService {
         let now = chrono::Utc::now().timestamp();
         let mut ribs = self.inner.rib_in.write().await;
         let rib = ribs.entry(peer.to_string()).or_insert_with(IpnetTrie::new);
+        // Plain IPv4 NLRI is only valid on a session that carries IPv4
+        // (negotiated v4 MP capability or a capability-less RFC 4271 peer).
+        let classic_ipv4_ok =
+            negotiated.plain_ipv4() || negotiated.supports(Afi::Ipv4, Safi::Unicast);
         for prefix in &update.withdrawn_prefixes {
-            if negotiated.supports(afi_for(prefix.prefix), Safi::Unicast) {
+            if classic_ipv4_ok {
                 rib.remove(prefix.prefix);
             }
         }
         for prefix in &update.announced_prefixes {
-            if negotiated.supports(afi_for(prefix.prefix), Safi::Unicast) {
+            if classic_ipv4_ok {
                 rib.insert(
                     prefix.prefix,
                     AdjRibValue {
@@ -816,18 +854,21 @@ fn build_announce_updates(
     negotiated: &NegotiatedCapabilities,
 ) -> Vec<BgpMessage> {
     let mut result = Vec::new();
+    let plain_ipv4 = negotiated.plain_ipv4();
     for prefix in prefixes
         .iter()
         .filter(|prefix| matches!(prefix.network, IpNet::V4(_)))
     {
-        let mut attrs = base_announce_attributes(local_as, negotiated.asn4);
-        let next_hop = prefix.next_hop.unwrap_or(IpAddr::V4(router_id));
-        attrs.add_attr(AttributeValue::NextHop(next_hop).into());
-        result.push(BgpMessage::Update(BgpUpdateMessage {
-            withdrawn_prefixes: vec![],
-            attributes: attrs,
-            announced_prefixes: vec![NetworkPrefix::new(prefix.network, None)],
-        }));
+        if plain_ipv4 || negotiated.supports(Afi::Ipv4, Safi::Unicast) {
+            let mut attrs = base_announce_attributes(local_as, negotiated.asn4);
+            let next_hop = prefix.next_hop.unwrap_or(IpAddr::V4(router_id));
+            attrs.add_attr(AttributeValue::NextHop(next_hop).into());
+            result.push(BgpMessage::Update(BgpUpdateMessage {
+                withdrawn_prefixes: vec![],
+                attributes: attrs,
+                announced_prefixes: vec![NetworkPrefix::new(prefix.network, None)],
+            }));
+        }
     }
     for prefix in prefixes
         .iter()
@@ -869,13 +910,6 @@ fn base_announce_attributes(local_as: u32, asn4: bool) -> Attributes {
         .into(),
     );
     attrs
-}
-
-fn afi_for(prefix: IpNet) -> Afi {
-    match prefix {
-        IpNet::V4(_) => Afi::Ipv4,
-        IpNet::V6(_) => Afi::Ipv6,
-    }
 }
 
 fn peer_state_code(state: PeerState) -> u16 {
