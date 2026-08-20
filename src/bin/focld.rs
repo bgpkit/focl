@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 
     let archive = ArchiveService::new(cfg.archive.clone(), collector_bgp_id).await?;
     let events_tx = archive.event_sender();
-    let bgp = BgpService::new(&cfg, events_tx).await?;
+    let bgp = BgpService::new_with_archive(&cfg, events_tx, Some(Arc::clone(&archive))).await?;
 
     let socket_path = cfg.global.control_socket.clone();
     cleanup_socket(&socket_path)?;
