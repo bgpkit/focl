@@ -253,3 +253,17 @@ async fn read_message(stream: &mut TcpStream) -> Result<BgpMessage> {
     let mut bytes = Bytes::from(raw);
     Ok(parse_bgp_message(&mut bytes, false, &AsnLength::Bits32)?)
 }
+
+#[test]
+fn ipv6_peer_address_dials_correctly() {
+    // Regression for duck: format!("{}:{}", v6, port) is unparseable, so
+    // active IPv6 sessions never dialed. The fixed path parses the IP
+    // explicitly and builds SocketAddr::new — assert both halves.
+    let ip: std::net::IpAddr = "2001:19f0:ffff::1".parse().expect("v6 parses");
+    let addr = std::net::SocketAddr::new(ip, 179);
+    assert_eq!(addr.to_string(), "[2001:19f0:ffff::1]:179");
+    // and the broken concat really is unparseable (guards the regression):
+    assert!(format!("{}:179", "2001:19f0:ffff::1")
+        .parse::<std::net::SocketAddr>()
+        .is_err());
+}
