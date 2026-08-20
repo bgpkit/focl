@@ -404,7 +404,12 @@ impl BgpService {
                         announced_prefixes: vec![],
                     })
                 };
-                write_bgp_message(stream, &eor, AsnLength::Bits32).await?;
+                let asn_len = if negotiated.asn4 {
+                    AsnLength::Bits32
+                } else {
+                    AsnLength::Bits16
+                };
+                write_bgp_message(stream, &eor, asn_len).await?;
             }
         }
 
@@ -550,7 +555,12 @@ impl BgpService {
             local_as,
             negotiated,
         ) {
-            let raw = write_bgp_message(stream, &update, AsnLength::Bits32).await?;
+            let asn_len = if negotiated.asn4 {
+                AsnLength::Bits32
+            } else {
+                AsnLength::Bits16
+            };
+            let raw = write_bgp_message(stream, &update, asn_len).await?;
             // Keep the collector's configured-prefix baseline alongside the
             // received feed; it lets a self-contained lab archive replay both
             // sides of this peering session.
@@ -860,7 +870,7 @@ fn build_announce_updates(
         .filter(|prefix| matches!(prefix.network, IpNet::V4(_)))
     {
         if plain_ipv4 || negotiated.supports(Afi::Ipv4, Safi::Unicast) {
-            let mut attrs = base_announce_attributes(local_as, negotiated.asn4);
+            let mut attrs = base_announce_attributes(local_as);
             let next_hop = prefix.next_hop.unwrap_or(IpAddr::V4(router_id));
             attrs.add_attr(AttributeValue::NextHop(next_hop).into());
             result.push(BgpMessage::Update(BgpUpdateMessage {
@@ -877,7 +887,7 @@ fn build_announce_updates(
         if !negotiated.supports(Afi::Ipv6, Safi::Unicast) {
             continue;
         }
-        let mut attrs = base_announce_attributes(local_as, negotiated.asn4);
+        let mut attrs = base_announce_attributes(local_as);
         // MP_REACH requires an IPv6 next hop. A configured non-v6 next hop is
         // ignored rather than serializing a malformed NEXT_HOP attribute.
         let next_hop = prefix
@@ -899,13 +909,18 @@ fn build_announce_updates(
     result
 }
 
-fn base_announce_attributes(local_as: u32, asn4: bool) -> Attributes {
+fn base_announce_attributes(local_as: u32) -> Attributes {
     let mut attrs = Attributes::default();
     attrs.add_attr(AttributeValue::Origin(Origin::IGP).into());
     attrs.add_attr(
         AttributeValue::AsPath {
             path: AsPath::from_sequence([local_as]),
-            is_as4: asn4,
+            // `is_as4: true` selects AS4_PATH (attribute type 17), which is
+            // only for the RFC 6793 migration fallback. On a session that
+            // negotiated 4-octet AS, the correct wire form is AS_PATH (type 2)
+            // with 4-octet segments: keep this false and let the session
+            // AsnLength (Bits32 when AS4, Bits16 otherwise) drive the width.
+            is_as4: false,
         }
         .into(),
     );
@@ -1018,6 +1033,73 @@ async fn read_bgp_message(stream: &mut TcpStream) -> Result<ReceivedMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn announce_updates_use_type2_as_path_with_negotiated_width() {
+        fn as_path_attr(msg: &BgpMessage, asn_len: AsnLength) -> (u8, Vec<u8>) {
+            let BgpMessage::Update(u) = msg else {
+                panic!("not an UPDATE")
+            };
+            let mut buf = bytes::BytesMut::new();
+            u.attributes.encode_to(asn_len, &mut buf).unwrap();
+            let mut p = 0;
+            while p < buf.len() {
+                let flags = buf[p];
+                let code = buf[p + 1];
+                let (l, hdr) = if flags & 0x10 != 0 {
+                    (u16::from_be_bytes([buf[p + 2], buf[p + 3]]) as usize, 4)
+                } else {
+                    (buf[p + 2] as usize, 3)
+                };
+                if code == 2 || code == 17 {
+                    return (code, buf[p + hdr..p + hdr + l].to_vec());
+                }
+                p += hdr + l;
+            }
+            panic!("no AS_PATH attribute found");
+        }
+
+        let prefixes = vec![PrefixEntry {
+            network: "192.0.2.0/24".parse().unwrap(),
+            next_hop: None,
+        }];
+
+        let negotiated = NegotiatedCapabilities {
+            families: HashSet::from([(Afi::Ipv4, Safi::Unicast)]),
+            asn4: true,
+            ..Default::default()
+        };
+        let updates = build_announce_updates(
+            &prefixes,
+            "192.0.2.1".parse().unwrap(),
+            IpAddr::V4("192.0.2.1".parse().unwrap()),
+            400644,
+            &negotiated,
+        );
+        // RFC 6793: AS4-capable session carries AS_PATH (type 2) with
+        // 4-octet segments, one AS_SEQUENCE {400644} = 0x00061D04.
+        let (code, val) = as_path_attr(&updates[0], AsnLength::Bits32);
+        assert_eq!(
+            (code, val.as_slice()),
+            (2u8, &[2u8, 1, 0x00, 0x06, 0x1D, 0x04][..])
+        );
+
+        // Plain 16-bit peer (e.g. local AS 65010): type 2 with 2-octet segments.
+        let plain = NegotiatedCapabilities {
+            families: HashSet::from([(Afi::Ipv4, Safi::Unicast)]),
+            asn4: false,
+            ..Default::default()
+        };
+        let updates = build_announce_updates(
+            &prefixes,
+            "192.0.2.1".parse().unwrap(),
+            IpAddr::V4("192.0.2.1".parse().unwrap()),
+            65010,
+            &plain,
+        );
+        let (code, val) = as_path_attr(&updates[0], AsnLength::Bits16);
+        assert_eq!((code, val.as_slice()), (2u8, &[2u8, 1, 0xFD, 0xF2][..]));
+    }
 
     #[test]
     fn local_open_advertises_dual_stack_as4_and_optional_route_refresh() {
