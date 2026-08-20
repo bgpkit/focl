@@ -324,11 +324,11 @@ impl BgpService {
     }
 
     async fn run_active_session(&self, peer: &PeerConfig) -> Result<()> {
-        let addr: SocketAddr = format!("{}:{}", peer.address, peer.remote_port)
+        let ip: IpAddr = peer
+            .address
             .parse()
-            .with_context(|| {
-                format!("invalid peer socket {}:{}", peer.address, peer.remote_port)
-            })?;
+            .with_context(|| format!("invalid peer address {}", peer.address))?;
+        let addr = SocketAddr::new(ip, peer.remote_port);
         let mut stream = connect_with_optional_bind(peer, addr).await?;
         self.run_session(peer, &mut stream).await
     }
