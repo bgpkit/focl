@@ -107,35 +107,59 @@ MRT; the archive knows nothing about BMP/BGP sessions.
 
 ## Phase 1 — make BGP peering mode a real collector
 
-1. **Adj-RIB-In store on ipnet-trie.** One trie per peer. Value model is
-   `{interned attribute-blob id (u32), last_change_ts, path_id?}` — raw
-   UPDATE bytes live only in MRT, never duplicated per prefix (fixes the
-   review's inconsistent-representation finding). Memory-only v1 (rusqlite
-   stays for the replication queue).
+1. **Adj-RIB-In store on ipnet-trie.** One trie per peer, value model is
+   `{interned attribute-blob id (u32), last_change_ts, path_id?}`. Memory-only v1
+   (rusqlite stays for the replication queue).
 2. **Wire the archive.** Received UPDATEs → `ingest_update` (exists, never
    called); FSM transitions → `ingest_peer_state` (events already flow).
    Rx-only by convention (RouteViews/RIS never archive tx).
 3. **Real RIB snapshots.** Dump adj-rib-in tries on the configured ribs
-   interval as one collector snapshot (single peer-index table, entries
-   grouped per prefix), replacing today's empty snapshot. **No RIB file is
-   emitted before a valid baseline exists** (fixes empty-dump bug). Pre-
-   policy semantics (`adj_rib_in` is already the config default).
+   interval, replacing today's empty snapshot. **No RIB file is emitted
+   before a valid baseline exists.** Pre-policy semantics (`adj_rib_in` is
+   already the config default).
 4. **Capability negotiation.** Advertise and validate the intersection of
    locally configured and peer-advertised capabilities: MP-BGP v4+v6,
-   route-refresh, AS4, extended-message, graceful-restart behavior, and
-   per-AFI/SAFI ADD-PATH policy. A capability-less OPEN establishes plain
-   IPv4 BGP; what it cannot do is IPv6/MP-BGP sessions — that is the real
-   gap (corrects review major 6). UPDATEs enter the trie only after
-   negotiated AFI/SAFI is known.
+   route-refresh, AS4, graceful-restart, per-AFI/SAFI ADD-PATH policy. A
+   capability-less OPEN establishes plain IPv4 BGP; what it cannot do is
+   IPv6/MP-BGP sessions — that is the real gap. UPDATEs enter the trie
+   only after negotiated AFI/SAFI is known.
 5. **Global passive listener** with per-peer match before any state
-   mutation, connection-collision handling, separate v4/v6 bind
-   configuration, and rejected-connection observability; replacing
-   per-peer binds; the `listen` global config becomes real.
-6. **Interop expansion.** Extend the GoBGP scripts: v6 session, capability
+   mutation, connection-collision handling, and separate v4/v6 bind
+   configuration; replacing per-peer binds; the `listen` global config
+   becomes real.
+6. **Reference interop target: duck (announcer replacement).** The
+   production reference is `duck`, the Vultr BGP announcer. Note duck runs
+   **BIRD** (not FRR) today; `/etc/bird/bird.conf` is the reference config:
+   - AS 400644, router id 149.28.81.209
+   - two Vultr sessions: v4 peer 169.254.169.254 and v6 peer
+     2001:19f0:ffff::1, both remote AS 64515, both with TCP-MD5 password
+   - announces 192.100.82.0/24 (next hop 149.28.81.209) and
+     2620:aa:a000::/48 (next hop 2001:19f0:6001:30cc:5400:5ff:fe61:25da)
+     with blackhole backing; `import none; export filter` policy
+   Phase 1 done means: focl replaces bird on duck for these two
+   announcements — active sessions to the Vultr peers with MD5, correct
+   MP-BGP capability negotiation (v4 session advertises v4; v6 session
+   negotiates MP-BGP v6 and announces via MP_REACH), routes present in
+   Vultr's looking glass, and MRT updates archived for both families.
+   Deployment is a separate manual step (routing-infrastructure change,
+   operator-driven).
+7. **Interop expansion.** Extend the GoBGP scripts: v6 session, capability
    matrix, flap → assert MRT files parse and contain expected elements.
    Negative tests (review minor 16): malformed UPDATE disposition, Peer
    Down clears the peer's trie, interrupted EoR yields no complete dump,
    duplicate Peer Up starts a new generation.
+8. **In-process announcement test (Phase 1 acceptance).** A test harness
+   peer with configured prefixes establishes with a test focl instance and
+   receives the configured announcements. Options:
+   - (a) **in-process harness peer** (recommended, v1): a minimal test-side
+     BGP speaker speaking open/keepalive/update, configured with its own
+     prefixes. focl announces its configured prefixes; the harness peer
+     announces its; both sides assert received announcements, adj-rib-in
+     trie state, and MRT archive output (parse back with bgpkit-parser).
+     No container fleet, no external router.
+   - (b) GoBGP testcontainer peer: heavier, CI-docker dependent, kept for
+     the interop expansion in item 7, not the acceptance gate.
+   The acceptance test is (a): deterministic, fast, runs in `cargo test`.
 
 ## Phase 2 — BMP station mode
 
