@@ -14,11 +14,13 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use focl::archive::types::ArchiveStream;
 use focl::archive::ArchiveService;
-use focl::bgp::BgpService;
+use focl::bgp::{BgpService, PrefixSource, PrefixStatus};
 use focl::config::{ArchiveConfig, FoclConfig, GlobalConfig, PeerConfig, PrefixConfig};
 use focl::types::{Event, PeerState};
+use ipnet::IpNet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio::time::timeout;
 
 const PEER_AS: u32 = 65_002;
@@ -168,6 +170,144 @@ async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()
     Ok(())
 }
 
+/// Builds a service with one passive peer and no configured prefixes.
+async fn service_with_passive_peer(temp: &tempfile::TempDir, port: u16) -> Result<BgpService> {
+    let cfg = FoclConfig {
+        global: GlobalConfig {
+            asn: FOCL_AS,
+            router_id: "192.0.2.1".to_string(),
+            listen: true,
+            listen_addr: format!("127.0.0.1:{port}"),
+            control_socket: temp.path().join("focld.sock"),
+            log_level: "warn".to_string(),
+        },
+        peers: vec![PeerConfig {
+            address: "127.0.0.1".to_string(),
+            remote_as: PEER_AS,
+            local_as: None,
+            hold_time_secs: 30,
+            connect_retry_secs: 1,
+            remote_port: port,
+            local_address: None,
+            enabled: true,
+            passive: true,
+            route_refresh: true,
+            name: None,
+            password: None,
+        }],
+        prefixes: vec![],
+        archive: ArchiveConfig {
+            enabled: false,
+            ..ArchiveConfig::default()
+        },
+    };
+    let (event_tx, _events) = broadcast::channel(16);
+    BgpService::new(&cfg, event_tx).await
+}
+
+/// Connects as the peer side and completes the OPEN/KEEPALIVE exchange.
+async fn establish_peer_session(port: u16, capabilities: Vec<u8>) -> Result<TcpStream> {
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await??;
+    assert!(matches!(
+        read_message(&mut stream).await?,
+        BgpMessage::Open(_)
+    ));
+    write_message(&mut stream, &peer_open_with_capabilities(capabilities)).await?;
+    assert!(matches!(
+        read_message(&mut stream).await?,
+        BgpMessage::KeepAlive
+    ));
+    write_message(&mut stream, &BgpMessage::KeepAlive).await?;
+    Ok(stream)
+}
+
+/// Runtime control has to reach an established session on the wire, and the
+/// session must survive both changes.
+#[tokio::test]
+async fn runtime_prefix_changes_reach_an_established_session() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let bgp = service_with_passive_peer(&temp, port).await?;
+    let mut stream = establish_peer_session(port, capabilities()).await?;
+
+    // With no configured prefixes, establishment sends only the two End-of-RIB
+    // markers (IPv4 empty UPDATE, IPv6 MP_UNREACH).
+    for _ in 0..2 {
+        assert!(matches!(
+            read_message(&mut stream).await?,
+            BgpMessage::Update(_)
+        ));
+    }
+
+    let network: IpNet = "203.0.113.0/24".parse()?;
+    let added = bgp.prefix_add(network, None, false).await?;
+    assert!(added.changed);
+    assert_eq!(added.peers_notified, vec!["127.0.0.1".to_string()]);
+    let announcement = read_message(&mut stream).await?;
+    assert!(
+        matches!(&announcement, BgpMessage::Update(update)
+            if update.announced_prefixes.iter()
+                .any(|prefix| prefix.prefix.to_string() == "203.0.113.0/24")),
+        "expected the runtime announcement on the wire, got {announcement:?}"
+    );
+
+    let removed = bgp.prefix_remove(network, false).await?;
+    assert!(removed.changed);
+    assert_eq!(removed.status, PrefixStatus::Absent);
+    assert_eq!(removed.source, Some(PrefixSource::Runtime));
+    let withdrawal = read_message(&mut stream).await?;
+    assert!(
+        matches!(&withdrawal, BgpMessage::Update(update)
+            if update.withdrawn_prefixes.iter()
+                .any(|prefix| prefix.prefix.to_string() == "203.0.113.0/24")),
+        "expected the runtime withdrawal on the wire, got {withdrawal:?}"
+    );
+
+    let peer = bgp
+        .peer_show("127.0.0.1")
+        .await
+        .context("peer stays configured")?;
+    assert!(matches!(peer.state, PeerState::Established));
+    Ok(())
+}
+
+/// A prefix must not be dispatched to a peer that did not negotiate its family.
+#[tokio::test]
+async fn runtime_changes_skip_peers_without_the_family() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let bgp = service_with_passive_peer(&temp, port).await?;
+    let mut stream = establish_peer_session(port, capabilities_v4_only()).await?;
+
+    // A v4-only peer receives just the IPv4 End-of-RIB marker.
+    assert!(matches!(
+        read_message(&mut stream).await?,
+        BgpMessage::Update(_)
+    ));
+
+    let v6: IpNet = "2001:db8::/48".parse()?;
+    let added = bgp
+        .prefix_add(v6, Some("2001:db8::1".parse()?), false)
+        .await?;
+    assert!(added.changed, "the originated set still changed");
+    assert!(
+        added.peers_notified.is_empty(),
+        "a v4-only peer must not be reported as notified: {:?}",
+        added.peers_notified
+    );
+    assert!(
+        timeout(Duration::from_millis(250), read_message(&mut stream))
+            .await
+            .is_err(),
+        "an IPv6 update must not reach a v4-only peer"
+    );
+    Ok(())
+}
+
 fn capabilities() -> Vec<u8> {
     let mut bytes = vec![1, 4, 0, 1, 0, 1, 1, 4, 0, 2, 0, 1, 65, 4];
     bytes.extend_from_slice(&PEER_AS.to_be_bytes());
@@ -175,7 +315,15 @@ fn capabilities() -> Vec<u8> {
     bytes
 }
 
-fn peer_open() -> BgpMessage {
+/// Same as [`capabilities`] without the IPv6 unicast multiprotocol capability.
+fn capabilities_v4_only() -> Vec<u8> {
+    let mut bytes = vec![1, 4, 0, 1, 0, 1, 65, 4];
+    bytes.extend_from_slice(&PEER_AS.to_be_bytes());
+    bytes.extend_from_slice(&[2, 0]);
+    bytes
+}
+
+fn peer_open_with_capabilities(capabilities: Vec<u8>) -> BgpMessage {
     BgpMessage::Open(BgpOpenMessage {
         version: 4,
         asn: Asn::new_16bit(PEER_AS as u16),
@@ -184,9 +332,13 @@ fn peer_open() -> BgpMessage {
         extended_length: false,
         opt_params: vec![OptParam {
             param_type: 2,
-            param_value: ParamValue::Raw(capabilities()),
+            param_value: ParamValue::Raw(capabilities),
         }],
     })
+}
+
+fn peer_open() -> BgpMessage {
+    peer_open_with_capabilities(capabilities())
 }
 
 fn attrs() -> Attributes {

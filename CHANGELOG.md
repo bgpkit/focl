@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 * A session is registered as a runtime-change target only after it is serving, and its negotiated address families travel with the registration, so dispatch and `--dry-run` targets name only the peers that can carry the update.
 * Runtime prefix mutations are serialized with their dispatch, so two concurrent control clients cannot enqueue a withdrawal before the announcement it reverses.
 * `prefix add` treats a next-hop change as a change (peers keep the old next hop until re-announced), a runtime entry shadows the configured entry for the same network, and the default next hop is taken from the config baseline only.
+* A session registers for runtime changes under the same lock as its initial table send, so a mutation racing with establishment cannot leave the new session advertising a stale set. `prefix remove` reports `source: null` for a network the state never knew instead of labelling it `config`.
+* Socket-level acceptance tests cover the runtime path: `prefix_add`/`prefix_remove` reach an established peer on the wire (announcement, withdrawal, session stays established) and a prefix is not dispatched to a peer that did not negotiate its family.
 * `focl --json` output now exits non-zero on a failed response; `--json` changes formatting only.
 
 ## v0.1.0 - 2025-02-21

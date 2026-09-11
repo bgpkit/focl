@@ -101,7 +101,10 @@ pub struct PrefixMutation {
     pub network: String,
     pub family: String,
     pub status: PrefixStatus,
-    pub source: PrefixSource,
+    /// Provenance of the network at the time of the mutation. `None` when the
+    /// state never knew it (for example removing a prefix that was neither
+    /// configured nor added).
+    pub source: Option<PrefixSource>,
     /// False when the effective originated set was already in the requested state.
     pub changed: bool,
     pub dry_run: bool,
@@ -208,11 +211,16 @@ impl PrefixState {
         }
     }
 
-    fn source_of(&self, network: &IpNet) -> PrefixSource {
+    /// Where a network's entry comes from, when the state knows it at all:
+    /// an unknown network (never configured, or a runtime entry already
+    /// dropped) has no provenance to report.
+    fn source_of(&self, network: &IpNet) -> Option<PrefixSource> {
         if self.added.contains_key(network) {
-            PrefixSource::Runtime
+            Some(PrefixSource::Runtime)
+        } else if self.config.iter().any(|entry| entry.network == *network) {
+            Some(PrefixSource::Config)
         } else {
-            PrefixSource::Config
+            None
         }
     }
 
@@ -728,19 +736,27 @@ impl BgpService {
             }
         }
 
-        // Register for runtime route changes only once the session is serving,
-        // and carry the negotiated families so dispatch can filter targets.
+        // Register and send the initial table under the mutation lock: a
+        // concurrent add/remove that lands between the snapshot and the
+        // registration would otherwise never reach this session, leaving it
+        // advertising a stale set until the next mutation.
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<SessionOp>(64);
-        let handle = SessionHandle {
-            tx: ctrl_tx,
-            supports_v4: negotiated.plain_ipv4() || negotiated.supports(Afi::Ipv4, Safi::Unicast),
-            supports_v6: negotiated.supports(Afi::Ipv6, Safi::Unicast),
-        };
-        self.inner
-            .session_ops
-            .write()
-            .await
-            .insert(peer.address.clone(), handle);
+        {
+            let _guard = self.inner.prefix_ops.lock().await;
+            let handle = SessionHandle {
+                tx: ctrl_tx,
+                supports_v4: negotiated.plain_ipv4()
+                    || negotiated.supports(Afi::Ipv4, Safi::Unicast),
+                supports_v6: negotiated.supports(Afi::Ipv6, Safi::Unicast),
+            };
+            self.inner
+                .session_ops
+                .write()
+                .await
+                .insert(peer.address.clone(), handle);
+            self.send_prefix_announcements(peer, &mut writer, &negotiated, local_ip)
+                .await?;
+        }
 
         let negotiated_hold = Duration::from_secs(hold_time as u64);
         let keepalive_interval = Duration::from_secs((hold_time as u64 / 3).max(1));
@@ -1180,6 +1196,8 @@ impl BgpService {
     /// Withdraws a prefix at runtime: a configured prefix is suppressed, a
     /// runtime-only one is dropped.
     pub async fn prefix_remove(&self, network: IpNet, dry_run: bool) -> Result<PrefixMutation> {
+        // Provenance has to be read before the entry is dropped.
+        let previous_source = self.inner.prefix_state.read().await.source_of(&network);
         let _guard = self.inner.prefix_ops.lock().await;
         let changed = if dry_run {
             self.inner.prefix_state.read().await.is_announced(&network)
@@ -1200,7 +1218,7 @@ impl BgpService {
             network: network.to_string(),
             family: family_name(&network),
             status: state.status_of(&network),
-            source: state.source_of(&network),
+            source: state.source_of(&network).or(previous_source),
             changed,
             dry_run,
             peers_notified,
@@ -1779,7 +1797,7 @@ mod tests {
         assert!(state.remove(&v6));
         assert_eq!(state.effective().len(), 1);
         assert_eq!(state.status_of(&v6), PrefixStatus::Suppressed);
-        assert_eq!(state.source_of(&v6), PrefixSource::Config);
+        assert_eq!(state.source_of(&v6), Some(PrefixSource::Config));
         // Removing it again changes nothing.
         assert!(!state.remove(&v6));
 
@@ -1797,7 +1815,7 @@ mod tests {
             network: runtime_only,
             next_hop: None,
         }));
-        assert_eq!(state.source_of(&runtime_only), PrefixSource::Runtime);
+        assert_eq!(state.source_of(&runtime_only), Some(PrefixSource::Runtime));
         assert_eq!(state.status_of(&runtime_only), PrefixStatus::Announced);
         assert!(state.remove(&runtime_only));
         assert_eq!(state.status_of(&runtime_only), PrefixStatus::Absent);
