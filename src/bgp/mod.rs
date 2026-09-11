@@ -16,7 +16,7 @@ use ipnet_trie::IpnetTrie;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
 
@@ -119,6 +119,25 @@ pub struct PrefixReload {
     pub peers_notified: Vec<String>,
 }
 
+/// An established session that accepts runtime route changes. The negotiated
+/// families travel with the sender so dispatch and dry-run targets report only
+/// peers that can actually carry the update.
+#[derive(Debug, Clone)]
+struct SessionHandle {
+    tx: mpsc::Sender<SessionOp>,
+    supports_v4: bool,
+    supports_v6: bool,
+}
+
+impl SessionHandle {
+    fn supports(&self, network: &IpNet) -> bool {
+        match network {
+            IpNet::V4(_) => self.supports_v4,
+            IpNet::V6(_) => self.supports_v6,
+        }
+    }
+}
+
 /// An outbound route change pushed into one established session.
 #[derive(Debug, Clone)]
 enum SessionOp {
@@ -153,15 +172,17 @@ impl PrefixState {
     }
 
     /// The set that is actually announced: (config + added) - suppressed.
+    /// A runtime entry shadows the configured one for the same network, so an
+    /// explicit `prefix add --next-hop` keeps working for configured prefixes.
     fn effective(&self) -> Vec<PrefixEntry> {
         let mut entries: Vec<PrefixEntry> = self
-            .config
+            .added
             .iter()
-            .filter(|entry| !self.suppressed.contains(&entry.network))
-            .cloned()
+            .filter(|(network, _)| !self.suppressed.contains(*network))
+            .map(|(_, entry)| entry.clone())
             .collect();
-        for (network, entry) in &self.added {
-            if self.suppressed.contains(network) || entries.iter().any(|e| e.network == *network) {
+        for entry in &self.config {
+            if self.suppressed.contains(&entry.network) || self.added.contains_key(&entry.network) {
                 continue;
             }
             entries.push(entry.clone());
@@ -195,11 +216,13 @@ impl PrefixState {
         }
     }
 
+    /// Configured next hop for the prefix's family, if any. Runtime additions
+    /// are deliberately excluded: inheriting from them would make the default
+    /// depend on the order of earlier commands.
     fn default_next_hop(&self, network: &IpNet) -> Option<IpAddr> {
         let wants_v4 = matches!(network, IpNet::V4(_));
         self.config
             .iter()
-            .chain(self.added.values())
             .filter_map(|entry| entry.next_hop)
             .find(|address| address.is_ipv4() == wants_v4)
     }
@@ -233,16 +256,26 @@ impl PrefixState {
         }
     }
 
-    /// Records a runtime addition (or clears an earlier suppression). Returns
-    /// whether the effective originated set changed.
+    /// Records a runtime addition or override. Returns whether the effective
+    /// originated set changed, which includes a next-hop change: peers keep the
+    /// old next hop until the prefix is announced again.
     fn add(&mut self, entry: PrefixEntry) -> bool {
         let network = entry.network;
         let was_announced = self.is_announced(&network);
+        let previous = self.added.get(&network).or_else(|| {
+            self.config
+                .iter()
+                .find(|configured| configured.network == network)
+        });
+        let next_hop_changed = previous.map(|previous| previous.next_hop) != Some(entry.next_hop);
+        let configured = self.config.iter().any(|e| e.network == network);
+        // A runtime entry wins over the config baseline for the same network.
+        let store = !configured || next_hop_changed || self.added.contains_key(&network);
         self.suppressed.remove(&network);
-        if self.added.contains_key(&network) || !self.config.iter().any(|e| e.network == network) {
+        if store {
             self.added.insert(network, entry);
         }
-        !was_announced
+        !was_announced || next_hop_changed
     }
 
     /// Withdraws a prefix: a runtime-only entry is dropped, a configured one is
@@ -354,8 +387,12 @@ struct BgpServiceInner {
     router_id: Ipv4Addr,
     /// Effective originated prefixes: config baseline plus runtime overrides.
     prefix_state: RwLock<PrefixState>,
+    /// Serializes each runtime prefix mutation with its session dispatch, so
+    /// concurrent control clients cannot enqueue a withdrawal before the
+    /// announcement it reverses.
+    prefix_ops: Mutex<()>,
     /// Established sessions that accept runtime route changes, keyed by peer address.
-    session_ops: RwLock<HashMap<String, mpsc::Sender<SessionOp>>>,
+    session_ops: RwLock<HashMap<String, SessionHandle>>,
     peers: RwLock<HashMap<String, PeerRuntime>>,
     rib_in: RwLock<HashMap<String, IpnetTrie<AdjRibValue>>>,
     session_local_ips: RwLock<HashMap<String, IpAddr>>,
@@ -396,6 +433,7 @@ impl BgpService {
             global_asn: cfg.global.asn,
             router_id,
             prefix_state: RwLock::new(PrefixState::new(prefixes)),
+            prefix_ops: Mutex::new(()),
             session_ops: RwLock::new(HashMap::new()),
             peers: RwLock::new(HashMap::new()),
             rib_in: RwLock::new(HashMap::new()),
@@ -471,7 +509,7 @@ impl BgpService {
         Ok(())
     }
 
-    async fn accept_inbound(&self, mut stream: TcpStream, remote: SocketAddr) {
+    async fn accept_inbound(&self, stream: TcpStream, remote: SocketAddr) {
         let peer = {
             let peers = self.inner.peers.read().await;
             peers
@@ -512,7 +550,7 @@ impl BgpService {
         let service = self.clone();
         let key = peer.address.clone();
         let task = tokio::spawn(async move {
-            let result = service.run_session(&peer, &mut stream).await;
+            let result = service.run_session(&peer, stream).await;
             service.clear_rib(&peer.address).await;
             match result {
                 Ok(()) => {
@@ -573,28 +611,18 @@ impl BgpService {
             .parse()
             .with_context(|| format!("invalid peer address {}", peer.address))?;
         let addr = SocketAddr::new(ip, peer.remote_port);
-        let mut stream = connect_with_optional_bind(peer, addr).await?;
-        self.run_session(peer, &mut stream).await
+        let stream = connect_with_optional_bind(peer, addr).await?;
+        self.run_session(peer, stream).await
     }
 
-    async fn run_session(&self, peer: &PeerConfig, stream: &mut TcpStream) -> Result<()> {
+    async fn run_session(&self, peer: &PeerConfig, stream: TcpStream) -> Result<()> {
         let local_ip = stream.local_addr()?.ip();
         self.inner
             .session_local_ips
             .write()
             .await
             .insert(peer.address.clone(), local_ip);
-        // Runtime route changes reach a session only while it is established;
-        // the receiver is polled from the session loop below.
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<SessionOp>(64);
-        self.inner
-            .session_ops
-            .write()
-            .await
-            .insert(peer.address.clone(), ctrl_tx);
-        let result = self
-            .run_session_inner(peer, stream, local_ip, ctrl_rx)
-            .await;
+        let result = self.run_session_inner(peer, stream, local_ip).await;
         self.inner.session_ops.write().await.remove(&peer.address);
         result
     }
@@ -602,13 +630,31 @@ impl BgpService {
     async fn run_session_inner(
         &self,
         peer: &PeerConfig,
-        stream: &mut TcpStream,
+        stream: TcpStream,
         local_ip: IpAddr,
-        mut ctrl_rx: mpsc::Receiver<SessionOp>,
     ) -> Result<()> {
-        // Split halves let the session write keepalives and runtime updates
-        // while a read is concurrently outstanding inside `select!`.
-        let (mut reader, mut writer) = stream.split();
+        let (reader, mut writer) = stream.into_split();
+        // One task owns framing, so a runtime operation can never cancel a
+        // partially consumed read: `read_exact` is not cancel-safe, and the
+        // session loop below selects between control operations and messages.
+        // The task ends when the socket closes or the receiver is dropped.
+        let (msg_tx, mut msg_rx) = mpsc::channel::<Result<ReceivedMessage>>(32);
+        tokio::spawn(async move {
+            let mut reader = reader;
+            loop {
+                match read_bgp_message(&mut reader).await {
+                    Ok(message) => {
+                        if msg_tx.send(Ok(message)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = msg_tx.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+        });
         self.set_peer_state(&peer.address, PeerState::OpenSent, None, None)
             .await;
 
@@ -622,7 +668,7 @@ impl BgpService {
         );
         write_bgp_message(&mut writer, &open, AsnLength::Bits32).await?;
 
-        let incoming = read_bgp_message(&mut reader).await?;
+        let incoming = next_bgp_message(&mut msg_rx).await?;
         let BgpMessage::Open(remote_open) = incoming.message else {
             return Err(anyhow!("expected OPEN from peer"));
         };
@@ -632,7 +678,7 @@ impl BgpService {
         self.set_peer_state(&peer.address, PeerState::OpenConfirm, None, None)
             .await;
         write_bgp_message(&mut writer, &BgpMessage::KeepAlive, AsnLength::Bits32).await?;
-        let incoming = read_bgp_message(&mut reader).await?;
+        let incoming = next_bgp_message(&mut msg_rx).await?;
         if !matches!(incoming.message, BgpMessage::KeepAlive) {
             return Err(anyhow!("expected KEEPALIVE from peer after OPEN"));
         }
@@ -682,6 +728,20 @@ impl BgpService {
             }
         }
 
+        // Register for runtime route changes only once the session is serving,
+        // and carry the negotiated families so dispatch can filter targets.
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<SessionOp>(64);
+        let handle = SessionHandle {
+            tx: ctrl_tx,
+            supports_v4: negotiated.plain_ipv4() || negotiated.supports(Afi::Ipv4, Safi::Unicast),
+            supports_v6: negotiated.supports(Afi::Ipv6, Safi::Unicast),
+        };
+        self.inner
+            .session_ops
+            .write()
+            .await
+            .insert(peer.address.clone(), handle);
+
         let negotiated_hold = Duration::from_secs(hold_time as u64);
         let keepalive_interval = Duration::from_secs((hold_time as u64 / 3).max(1));
         let mut next_keepalive = Instant::now() + keepalive_interval;
@@ -710,16 +770,16 @@ impl BgpService {
                             .await?;
                     }
                 }
-                result = timeout(timeout_dur, read_bgp_message(&mut reader)) => {
-                    match result {
-                        Ok(Ok(incoming)) => match incoming.message {
+                incoming = timeout(timeout_dur, msg_rx.recv()) => {
+                    match incoming {
+                        Ok(Some(Ok(message))) => match message.message {
                             BgpMessage::Update(update) => {
                                 self.ingest_received_update(
                                     peer,
                                     local_as,
                                     local_ip,
                                     update,
-                                    incoming.raw,
+                                    message.raw,
                                     &negotiated,
                                 )
                                 .await?;
@@ -734,7 +794,9 @@ impl BgpService {
                                 return Err(anyhow!("received NOTIFICATION from peer"))
                             }
                         },
-                        Ok(Err(error)) => return Err(error),
+                        Ok(Some(Err(error))) => return Err(error),
+                        Ok(None) => return Err(anyhow!("peer reader stopped")),
+                        // Tick: keepalive and hold timers are handled above.
                         Err(_) => {}
                     }
                 }
@@ -1076,6 +1138,9 @@ impl BgpService {
         next_hop: Option<IpAddr>,
         dry_run: bool,
     ) -> Result<PrefixMutation> {
+        // Serialize the mutation with its dispatch: two concurrent control
+        // clients must not be able to enqueue changes out of order.
+        let _guard = self.inner.prefix_ops.lock().await;
         if let Some(next_hop) = next_hop {
             ensure_next_hop_family(&network, next_hop)?;
         }
@@ -1095,7 +1160,7 @@ impl BgpService {
         let peers_notified = if !changed {
             Vec::new()
         } else if dry_run {
-            self.session_targets().await
+            self.session_targets(&network).await
         } else {
             self.dispatch_session_op(SessionOp::Announce(entry)).await
         };
@@ -1115,6 +1180,7 @@ impl BgpService {
     /// Withdraws a prefix at runtime: a configured prefix is suppressed, a
     /// runtime-only one is dropped.
     pub async fn prefix_remove(&self, network: IpNet, dry_run: bool) -> Result<PrefixMutation> {
+        let _guard = self.inner.prefix_ops.lock().await;
         let changed = if dry_run {
             self.inner.prefix_state.read().await.is_announced(&network)
         } else {
@@ -1123,7 +1189,7 @@ impl BgpService {
         let peers_notified = if !changed {
             Vec::new()
         } else if dry_run {
-            self.session_targets().await
+            self.session_targets(&network).await
         } else {
             self.dispatch_session_op(SessionOp::Withdraw { network })
                 .await
@@ -1144,6 +1210,7 @@ impl BgpService {
     /// Re-reads the configured prefix list, applies the delta, and clears every
     /// runtime override. Peer sessions and other config sections are untouched.
     pub async fn reload_prefixes(&self, cfg: &FoclConfig) -> Result<PrefixReload> {
+        let _guard = self.inner.prefix_ops.lock().await;
         let entries = parse_prefix_entries(cfg)?;
         let (announce, withdraw, overrides_reset) = {
             let mut state = self.inner.prefix_state.write().await;
@@ -1177,20 +1244,25 @@ impl BgpService {
         })
     }
 
-    /// Dispatches one route change to every established session, returning the
-    /// peers whose session accepted it.
+    /// Dispatches one route change to every established session that carries
+    /// the prefix's address family, returning the peers that accepted it.
     async fn dispatch_session_op(&self, op: SessionOp) -> Vec<String> {
-        let senders: Vec<(String, mpsc::Sender<SessionOp>)> = self
+        let network = match &op {
+            SessionOp::Announce(entry) => entry.network,
+            SessionOp::Withdraw { network } => *network,
+        };
+        let handles: Vec<(String, SessionHandle)> = self
             .inner
             .session_ops
             .read()
             .await
             .iter()
-            .map(|(peer, sender)| (peer.clone(), sender.clone()))
+            .filter(|(_, handle)| handle.supports(&network))
+            .map(|(peer, handle)| (peer.clone(), handle.clone()))
             .collect();
         let mut notified = Vec::new();
-        for (peer, sender) in senders {
-            if sender.send(op.clone()).await.is_ok() {
+        for (peer, handle) in handles {
+            if handle.tx.send(op.clone()).await.is_ok() {
                 notified.push(peer);
             }
         }
@@ -1198,15 +1270,17 @@ impl BgpService {
         notified
     }
 
-    /// Established sessions without dispatching anything (`--dry-run`).
-    async fn session_targets(&self) -> Vec<String> {
+    /// Established sessions that could carry the prefix's family, without
+    /// dispatching anything (`--dry-run`).
+    async fn session_targets(&self, network: &IpNet) -> Vec<String> {
         let mut targets: Vec<String> = self
             .inner
             .session_ops
             .read()
             .await
-            .keys()
-            .cloned()
+            .iter()
+            .filter(|(_, handle)| handle.supports(network))
+            .map(|(peer, _)| peer.clone())
             .collect();
         targets.sort();
         targets
@@ -1560,6 +1634,17 @@ async fn write_bgp_message<W: AsyncWrite + Unpin>(
     Ok(bytes)
 }
 
+/// Awaits the next framed message from a session's reader task.
+async fn next_bgp_message(
+    rx: &mut mpsc::Receiver<Result<ReceivedMessage>>,
+) -> Result<ReceivedMessage> {
+    match rx.recv().await {
+        Some(Ok(message)) => Ok(message),
+        Some(Err(error)) => Err(error),
+        None => Err(anyhow!("peer reader stopped")),
+    }
+}
+
 async fn read_bgp_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<ReceivedMessage> {
     let mut header = [0u8; 19];
     stream.read_exact(&mut header).await?;
@@ -1834,6 +1919,82 @@ mod tests {
         let v6: IpNet = "2001:db8::/48".parse().unwrap();
         assert!(ensure_next_hop_family(&v6, "192.0.2.1".parse().unwrap()).is_err());
         assert!(ensure_next_hop_family(&v6, "2001:db8::1".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn next_hop_change_is_a_change() {
+        let network: IpNet = "198.51.100.0/24".parse().unwrap();
+        let first: IpAddr = "192.0.2.1".parse().unwrap();
+        let second: IpAddr = "192.0.2.9".parse().unwrap();
+        let mut state = PrefixState::new(vec![]);
+
+        assert!(state.add(PrefixEntry {
+            network,
+            next_hop: Some(first),
+        }));
+        // Same next hop again: nothing to announce.
+        assert!(!state.add(PrefixEntry {
+            network,
+            next_hop: Some(first),
+        }));
+        // A different next hop must re-announce, and the effective entry follows.
+        assert!(state.add(PrefixEntry {
+            network,
+            next_hop: Some(second),
+        }));
+        let effective = state.effective();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].next_hop, Some(second));
+    }
+
+    #[test]
+    fn runtime_override_shadows_the_configured_next_hop() {
+        let network: IpNet = "192.0.2.0/24".parse().unwrap();
+        let configured: IpAddr = "10.0.0.1".parse().unwrap();
+        let override_hop: IpAddr = "10.0.0.9".parse().unwrap();
+        let mut state = PrefixState::new(vec![PrefixEntry {
+            network,
+            next_hop: Some(configured),
+        }]);
+
+        assert!(!state.add(PrefixEntry {
+            network,
+            next_hop: Some(configured),
+        }));
+        assert!(state.add(PrefixEntry {
+            network,
+            next_hop: Some(override_hop),
+        }));
+        let effective = state.effective();
+        assert_eq!(
+            effective.len(),
+            1,
+            "the config entry must not be duplicated"
+        );
+        assert_eq!(effective[0].next_hop, Some(override_hop));
+    }
+
+    #[test]
+    fn default_next_hop_comes_from_the_config_only() {
+        let v4: IpNet = "192.0.2.0/24".parse().unwrap();
+        let v6: IpNet = "2001:db8::/48".parse().unwrap();
+        let mut state = PrefixState::new(vec![PrefixEntry {
+            network: v4,
+            next_hop: Some("10.0.0.1".parse().unwrap()),
+        }]);
+
+        assert_eq!(
+            state.default_next_hop(&v4),
+            Some("10.0.0.1".parse().unwrap())
+        );
+        // No configured v6 next hop: a runtime addition must not become the
+        // default for later commands.
+        assert_eq!(state.default_next_hop(&v6), None);
+        state.add(PrefixEntry {
+            network: v6,
+            next_hop: Some("2001:db8::1".parse().unwrap()),
+        });
+        assert_eq!(state.default_next_hop(&v6), None);
     }
 
     fn test_service_config() -> FoclConfig {

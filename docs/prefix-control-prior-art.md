@@ -61,3 +61,27 @@ UNVERIFIED.
   `reload` reset, and `focl peer list`/`rib out` for verification.
 - Config write-back: runtime commands never edit `focl.toml` (GoBGP/OpenBGPD behavior; keeps the config
   file reviewable by hand).
+
+## Sources
+
+Primary sources for each row of the comparison (fetched 2026-09-11):
+
+- OpenBGPD: `bgpctl(8)` and `bgpd.conf(5)` man pages - https://man.openbsd.org/bgpctl.8 ,
+  https://man.openbsd.org/bgpd.conf.5 (verified back to OpenBSD 4.6: https://man.openbsd.org/OpenBSD-4.6/bgpctl.8)
+- GoBGP: `docs/sources/cli-command-syntax.md`, `cli-operations.md`, `policy.md`,
+  `pkg/config/oc/serve.go`, `internal/pkg/table/destination.go` -
+  https://github.com/osrg/gobgp/blob/master/docs/sources/cli-command-syntax.md ,
+  https://github.com/osrg/gobgp/blob/master/docs/sources/policy.md
+- BIRD 2/3: `birdc` remote-control chapter and the static protocol implementation -
+  https://bird.nic.cz/doc/bird-3.3.2.html , https://bird.nic.cz/doc/bird-2.19.2.html ,
+  https://github.com/CZ-NIC/bird/blob/v2.19.2/proto/static/static.c
+- FRR: BGP and basic-command documentation - https://docs.frrouting.org/en/latest/bgp.html ,
+  https://docs.frrouting.org/en/latest/basic.html , `vtysh` man page
+- Junos: static-route and policy-statement reference, commit/rollback topics -
+  https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/ref/statement/static-edit-routing-options.html
+- RouterOS: `/routing bgp` reference and the v6-to-v7 migration page -
+  https://help.mikrotik.com/docs/spaces/ROS/pages/331612228/routing%2Bbgp ,
+  https://help.mikrotik.com/docs/spaces/ROS/pages/30474256/Moving+from+ROSv6+to+v7+with+examples
+- ExaBGP: API commands and text API reference - https://github.com/Exa-Networks/exabgp/wiki/API-Commands
+- RustyBGP: https://github.com/osrg/rustybgp (GoBGP-compatible gRPC API and CLI)
+- freeRtr: config examples and BGP source - https://github.com/mc36/freeRtr/blob/master/cfg/intop1-bgp10.tst

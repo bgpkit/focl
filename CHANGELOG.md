@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
 ### Code improvements
 
 * Outbound route changes are dispatched to established sessions through a per-session channel, and the session loop now selects between that channel and the socket read on split read/write halves. Update encoding for both directions is shared with the establishment path (`emit_updates`).
+* Session framing moved to a dedicated reader task: the session loop selects between control operations and incoming messages, and `read_exact` is no longer cancelled mid-message by an operation.
+* A session is registered as a runtime-change target only after it is serving, and its negotiated address families travel with the registration, so dispatch and `--dry-run` targets name only the peers that can carry the update.
+* Runtime prefix mutations are serialized with their dispatch, so two concurrent control clients cannot enqueue a withdrawal before the announcement it reverses.
+* `prefix add` treats a next-hop change as a change (peers keep the old next hop until re-announced), a runtime entry shadows the configured entry for the same network, and the default next hop is taken from the config baseline only.
+* `focl --json` output now exits non-zero on a failed response; `--json` changes formatting only.
 
 ## v0.1.0 - 2025-02-21
 

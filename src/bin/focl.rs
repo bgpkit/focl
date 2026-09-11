@@ -68,7 +68,8 @@ enum PrefixCommands {
         /// Network in CIDR notation, e.g. 2620:aa:a000::/48
         network: String,
         /// Next hop for the announcement. Defaults to the configured next hop
-        /// of the same family, else the session's own address
+        /// of the same family; otherwise IPv4 falls back to the router ID and
+        /// IPv6 to the session's own address when that address is IPv6
         #[arg(long)]
         next_hop: Option<String>,
         /// Validate and report what would be sent without sending it
@@ -287,11 +288,17 @@ fn uuid_like_id() -> String {
     )
 }
 
+/// Prints the raw control response. `--json` changes formatting only: a failed
+/// response still exits non-zero so scripts can detect it.
 fn print_response(response: ControlResponse) {
+    let ok = response.ok;
     println!(
         "{}",
         serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
     );
+    if !ok {
+        std::process::exit(1);
+    }
 }
 
 fn fail_on_error(response: &ControlResponse) -> Result<()> {
