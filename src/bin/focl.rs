@@ -3,6 +3,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use focl::bgp::{PrefixMutation, PrefixSource, PrefixStatus, PrefixView};
 use focl::types::{ControlRequest, ControlResponse};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -34,6 +35,12 @@ enum Commands {
         #[command(subcommand)]
         command: RibCommands,
     },
+    /// Runtime announce/withdraw of originated prefixes (in-memory overrides;
+    /// `reload` resets them to the config file)
+    Prefix {
+        #[command(subcommand)]
+        command: PrefixCommands,
+    },
     Archive {
         #[command(subcommand)]
         command: ArchiveCommands,
@@ -52,6 +59,44 @@ enum RibCommands {
     Summary,
     In { peer: String },
     Out { peer: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum PrefixCommands {
+    /// Announce a prefix now (no session reset); also clears a suppression
+    Add {
+        /// Network in CIDR notation, e.g. 2620:aa:a000::/48
+        network: String,
+        /// Next hop for the announcement. Defaults to the configured next hop
+        /// of the same family; otherwise IPv4 falls back to the router ID and
+        /// IPv6 to the session's own address when that address is IPv6
+        #[arg(long)]
+        next_hop: Option<String>,
+        /// Validate and report what would be sent without sending it
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the raw control response as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Withdraw a prefix now: a configured prefix is suppressed, a
+    /// runtime-only one is dropped
+    Remove {
+        /// Network in CIDR notation
+        network: String,
+        /// Validate and report what would be sent without sending it
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the raw control response as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the effective originated prefix set (config plus runtime overrides)
+    List {
+        /// Print the raw control response as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -121,6 +166,44 @@ async fn main() -> Result<()> {
                 let response =
                     send_control_request(&cli.socket, "rib_out", json!({"peer": peer})).await?;
                 print_response(response);
+            }
+        },
+        Commands::Prefix { command } => match command {
+            PrefixCommands::Add {
+                network,
+                next_hop,
+                dry_run,
+                json,
+            } => {
+                let response = send_control_request(
+                    &cli.socket,
+                    "prefix_add",
+                    json!({"network": network, "next_hop": next_hop, "dry_run": dry_run}),
+                )
+                .await?;
+                finish_prefix_response(response, json)?;
+            }
+            PrefixCommands::Remove {
+                network,
+                dry_run,
+                json,
+            } => {
+                let response = send_control_request(
+                    &cli.socket,
+                    "prefix_remove",
+                    json!({"network": network, "dry_run": dry_run}),
+                )
+                .await?;
+                finish_prefix_response(response, json)?;
+            }
+            PrefixCommands::List { json } => {
+                let response = send_control_request(&cli.socket, "prefix_list", json!({})).await?;
+                if json {
+                    print_response(response);
+                } else {
+                    fail_on_error(&response)?;
+                    print_prefix_list(&response)?;
+                }
             }
         },
         Commands::Archive { command } => match command {
@@ -205,9 +288,120 @@ fn uuid_like_id() -> String {
     )
 }
 
+/// Prints the raw control response. `--json` changes formatting only: a failed
+/// response still exits non-zero so scripts can detect it.
 fn print_response(response: ControlResponse) {
+    let ok = response.ok;
     println!(
         "{}",
         serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
     );
+    if !ok {
+        std::process::exit(1);
+    }
+}
+
+fn fail_on_error(response: &ControlResponse) -> Result<()> {
+    if response.ok {
+        return Ok(());
+    }
+    match &response.error {
+        Some(error) => eprintln!("error: {} ({})", error.message, error.code),
+        None => eprintln!("error: control request failed"),
+    }
+    std::process::exit(1);
+}
+
+/// One-line result for `prefix add` / `prefix remove`, or the raw response
+/// with `--json`.
+fn finish_prefix_response(response: ControlResponse, json: bool) -> Result<()> {
+    if json {
+        print_response(response);
+        return Ok(());
+    }
+    fail_on_error(&response)?;
+    let mutation: PrefixMutation = serde_json::from_value(response.result.unwrap_or_default())?;
+    let peers = mutation.peers_notified.len();
+    let peer_list = if mutation.peers_notified.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", mutation.peers_notified.join(", "))
+    };
+    if mutation.dry_run {
+        if mutation.changed {
+            println!(
+                "dry-run: would {} {} ({}) to {} established peer(s){}",
+                mutation.action, mutation.network, mutation.family, peers, peer_list
+            );
+        } else {
+            println!(
+                "dry-run: no change for {} ({})",
+                mutation.network, mutation.family
+            );
+        }
+    } else if mutation.changed {
+        let verb = if mutation.action == "announce" {
+            "announced"
+        } else {
+            "withdrew"
+        };
+        println!(
+            "{} {} ({}) to {} established peer(s){}",
+            verb, mutation.network, mutation.family, peers, peer_list
+        );
+    } else {
+        println!(
+            "no change: {} ({}) is already {}",
+            mutation.network,
+            mutation.family,
+            status_word(mutation.status)
+        );
+    }
+    Ok(())
+}
+
+fn print_prefix_list(response: &ControlResponse) -> Result<()> {
+    let result = response.result.clone().unwrap_or_default();
+    let prefixes: Vec<PrefixView> =
+        serde_json::from_value(result.get("prefixes").cloned().unwrap_or_default())?;
+    if prefixes.is_empty() {
+        println!("no originated prefixes");
+        return Ok(());
+    }
+    let network_width = prefixes
+        .iter()
+        .map(|prefix| prefix.network.len())
+        .max()
+        .unwrap_or(0)
+        .max("NETWORK".len());
+    println!(
+        "{:<network_width$}  {:<6}  {:<10}  {:<7}  NEXT HOP",
+        "NETWORK", "FAMILY", "STATUS", "SOURCE"
+    );
+    for prefix in prefixes {
+        println!(
+            "{:<network_width$}  {:<6}  {:<10}  {:<7}  {}",
+            prefix.network,
+            prefix.family,
+            status_word(prefix.status),
+            source_word(prefix.source),
+            prefix.next_hop.unwrap_or_else(|| "-".to_string())
+        );
+    }
+    Ok(())
+}
+
+fn status_word(status: PrefixStatus) -> &'static str {
+    match status {
+        PrefixStatus::Announced => "announced",
+        PrefixStatus::Suppressed => "suppressed",
+        PrefixStatus::Absent => "absent",
+    }
+}
+
+fn source_word(source: PrefixSource) -> &'static str {
+    match source {
+        PrefixSource::Config => "config",
+        PrefixSource::Runtime => "runtime",
+    }
 }
