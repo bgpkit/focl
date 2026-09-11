@@ -27,6 +27,7 @@ The project consists of:
 - [x] IPv4 and IPv6 unicast support
 - [x] TCP-MD5 authentication (RFC 2385) for BGP session security
 - [x] Static prefix announcements
+- [x] Runtime prefix announce/withdraw via `focl prefix` (in-memory overrides)
 - [x] Full BGP FSM with proper timers (hold/keepalive)
 - [x] Active and passive peer modes
 - [x] Route refresh capability
@@ -102,6 +103,11 @@ focl peer list
 focl peer show 192.0.2.2
 focl rib summary
 focl rib out 192.0.2.2
+
+# Runtime announce/withdraw (no restart, no session reset)
+focl prefix list
+focl prefix add 203.0.113.0/24
+focl prefix remove 203.0.113.0/24
 ```
 
 ## Example: Dual-Stack Configuration

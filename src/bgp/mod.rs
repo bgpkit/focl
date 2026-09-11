@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,9 +14,9 @@ use bytes::Bytes;
 use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
 
@@ -65,6 +65,261 @@ struct PrefixEntry {
     next_hop: Option<IpAddr>,
 }
 
+/// Where an originated prefix comes from: the config baseline or a runtime
+/// `focl prefix add`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixSource {
+    Config,
+    Runtime,
+}
+
+/// Announced state of a prefix in the effective originated set. `Absent` only
+/// appears in mutation results, where the prefix is no longer part of the set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefixStatus {
+    Announced,
+    Suppressed,
+    Absent,
+}
+
+/// One row of `focl prefix list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixView {
+    pub network: String,
+    pub family: String,
+    pub next_hop: Option<String>,
+    pub status: PrefixStatus,
+    pub source: PrefixSource,
+}
+
+/// Outcome of `focl prefix add` / `focl prefix remove`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixMutation {
+    pub action: String,
+    pub network: String,
+    pub family: String,
+    pub status: PrefixStatus,
+    pub source: PrefixSource,
+    /// False when the effective originated set was already in the requested state.
+    pub changed: bool,
+    pub dry_run: bool,
+    /// Established sessions the update was dispatched to (empty on a no-op;
+    /// sessions filter by negotiated address family).
+    pub peers_notified: Vec<String>,
+}
+
+/// Outcome of a `reload` for the originated prefix set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixReload {
+    pub announced: Vec<String>,
+    pub withdrawn: Vec<String>,
+    pub overrides_reset: usize,
+    pub peers_notified: Vec<String>,
+}
+
+/// An outbound route change pushed into one established session.
+#[derive(Debug, Clone)]
+enum SessionOp {
+    Announce(PrefixEntry),
+    Withdraw { network: IpNet },
+}
+
+/// Runtime overrides layered over the configured prefix list.
+///
+/// The config file stays the baseline; `added` and `suppressed` win until a
+/// `reload` resets them. Runtime state is deliberately in-memory and never
+/// written back to the config file, matching GoBGP's in-memory RIB and
+/// OpenBGPD's dynamically added networks.
+#[derive(Debug, Clone, Default)]
+struct PrefixState {
+    config: Vec<PrefixEntry>,
+    added: BTreeMap<IpNet, PrefixEntry>,
+    suppressed: BTreeSet<IpNet>,
+}
+
+impl PrefixState {
+    fn new(config: Vec<PrefixEntry>) -> Self {
+        Self {
+            config,
+            added: BTreeMap::new(),
+            suppressed: BTreeSet::new(),
+        }
+    }
+
+    fn override_count(&self) -> usize {
+        self.added.len() + self.suppressed.len()
+    }
+
+    /// The set that is actually announced: (config + added) - suppressed.
+    fn effective(&self) -> Vec<PrefixEntry> {
+        let mut entries: Vec<PrefixEntry> = self
+            .config
+            .iter()
+            .filter(|entry| !self.suppressed.contains(&entry.network))
+            .cloned()
+            .collect();
+        for (network, entry) in &self.added {
+            if self.suppressed.contains(network) || entries.iter().any(|e| e.network == *network) {
+                continue;
+            }
+            entries.push(entry.clone());
+        }
+        entries
+    }
+
+    fn is_known(&self, network: &IpNet) -> bool {
+        self.added.contains_key(network) || self.config.iter().any(|e| e.network == *network)
+    }
+
+    fn is_announced(&self, network: &IpNet) -> bool {
+        self.is_known(network) && !self.suppressed.contains(network)
+    }
+
+    fn status_of(&self, network: &IpNet) -> PrefixStatus {
+        if self.is_announced(network) {
+            PrefixStatus::Announced
+        } else if self.is_known(network) {
+            PrefixStatus::Suppressed
+        } else {
+            PrefixStatus::Absent
+        }
+    }
+
+    fn source_of(&self, network: &IpNet) -> PrefixSource {
+        if self.added.contains_key(network) {
+            PrefixSource::Runtime
+        } else {
+            PrefixSource::Config
+        }
+    }
+
+    fn default_next_hop(&self, network: &IpNet) -> Option<IpAddr> {
+        let wants_v4 = matches!(network, IpNet::V4(_));
+        self.config
+            .iter()
+            .chain(self.added.values())
+            .filter_map(|entry| entry.next_hop)
+            .find(|address| address.is_ipv4() == wants_v4)
+    }
+
+    fn view(&self) -> Vec<PrefixView> {
+        let mut rows: Vec<PrefixView> = self
+            .config
+            .iter()
+            .map(|entry| self.view_of(entry, PrefixSource::Config))
+            .collect();
+        for (network, entry) in &self.added {
+            if self.config.iter().any(|e| e.network == *network) {
+                continue;
+            }
+            rows.push(self.view_of(entry, PrefixSource::Runtime));
+        }
+        rows
+    }
+
+    fn view_of(&self, entry: &PrefixEntry, source: PrefixSource) -> PrefixView {
+        PrefixView {
+            network: entry.network.to_string(),
+            family: family_name(&entry.network),
+            next_hop: entry.next_hop.map(|address| address.to_string()),
+            status: if self.suppressed.contains(&entry.network) {
+                PrefixStatus::Suppressed
+            } else {
+                PrefixStatus::Announced
+            },
+            source,
+        }
+    }
+
+    /// Records a runtime addition (or clears an earlier suppression). Returns
+    /// whether the effective originated set changed.
+    fn add(&mut self, entry: PrefixEntry) -> bool {
+        let network = entry.network;
+        let was_announced = self.is_announced(&network);
+        self.suppressed.remove(&network);
+        if self.added.contains_key(&network) || !self.config.iter().any(|e| e.network == network) {
+            self.added.insert(network, entry);
+        }
+        !was_announced
+    }
+
+    /// Withdraws a prefix: a runtime-only entry is dropped, a configured one is
+    /// suppressed. Returns whether the effective originated set changed.
+    fn remove(&mut self, network: &IpNet) -> bool {
+        let was_announced = self.is_announced(network);
+        if self.added.remove(network).is_some() {
+            return was_announced;
+        }
+        if self.config.iter().any(|e| e.network == *network) {
+            self.suppressed.insert(*network);
+        }
+        was_announced
+    }
+
+    /// Replaces the config baseline and drops every runtime override, returning
+    /// the prefixes to announce and to withdraw.
+    fn reset_overrides(&mut self, config: Vec<PrefixEntry>) -> (Vec<PrefixEntry>, Vec<IpNet>) {
+        let before = self.effective();
+        self.config = config;
+        self.added.clear();
+        self.suppressed.clear();
+        let after = self.effective();
+        let announce = after
+            .iter()
+            .filter(|entry| !before.iter().any(|old| old.network == entry.network))
+            .cloned()
+            .collect();
+        let withdraw = before
+            .iter()
+            .filter(|entry| !after.iter().any(|new| new.network == entry.network))
+            .map(|entry| entry.network)
+            .collect();
+        (announce, withdraw)
+    }
+}
+
+fn family_name(network: &IpNet) -> String {
+    match network {
+        IpNet::V4(_) => "v4",
+        IpNet::V6(_) => "v6",
+    }
+    .to_string()
+}
+
+/// Parses the configured `[[prefixes]]` list into the baseline entry set.
+fn parse_prefix_entries(cfg: &FoclConfig) -> Result<Vec<PrefixEntry>> {
+    cfg.prefixes
+        .iter()
+        .map(|p| {
+            let network = IpNet::from_str(&p.network)
+                .with_context(|| format!("invalid prefix network: {}", p.network))?;
+            let next_hop = p
+                .next_hop
+                .as_ref()
+                .map(|nh| nh.parse::<IpAddr>())
+                .transpose()
+                .with_context(|| format!("invalid next-hop address: {:?}", p.next_hop))?;
+            Ok::<_, anyhow::Error>(PrefixEntry { network, next_hop })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context("invalid prefix in config")
+}
+
+fn ensure_next_hop_family(network: &IpNet, next_hop: IpAddr) -> Result<()> {
+    let matches_family = matches!(
+        (network, next_hop),
+        (IpNet::V4(_), IpAddr::V4(_)) | (IpNet::V6(_), IpAddr::V6(_))
+    );
+    if matches_family {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "next hop {next_hop} does not match the prefix family of {network}"
+    ))
+}
+
 /// A deliberately owned, uninterned v1 Adj-RIB-In value. Attribute interning is
 /// deferred until the collector's memory profile is measured under real feeds.
 #[derive(Debug, Clone)]
@@ -97,7 +352,10 @@ impl NegotiatedCapabilities {
 struct BgpServiceInner {
     global_asn: u32,
     router_id: Ipv4Addr,
-    prefixes: Vec<PrefixEntry>,
+    /// Effective originated prefixes: config baseline plus runtime overrides.
+    prefix_state: RwLock<PrefixState>,
+    /// Established sessions that accept runtime route changes, keyed by peer address.
+    session_ops: RwLock<HashMap<String, mpsc::Sender<SessionOp>>>,
     peers: RwLock<HashMap<String, PeerRuntime>>,
     rib_in: RwLock<HashMap<String, IpnetTrie<AdjRibValue>>>,
     session_local_ips: RwLock<HashMap<String, IpAddr>>,
@@ -133,26 +391,12 @@ impl BgpService {
             .router_id
             .parse::<Ipv4Addr>()
             .context("global.router_id must be IPv4")?;
-        let prefixes = cfg
-            .prefixes
-            .iter()
-            .map(|p| {
-                let network = IpNet::from_str(&p.network)
-                    .with_context(|| format!("invalid prefix network: {}", p.network))?;
-                let next_hop = p
-                    .next_hop
-                    .as_ref()
-                    .map(|nh| nh.parse::<IpAddr>())
-                    .transpose()
-                    .with_context(|| format!("invalid next-hop address: {:?}", p.next_hop))?;
-                Ok::<_, anyhow::Error>(PrefixEntry { network, next_hop })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .context("invalid prefix in config")?;
+        let prefixes = parse_prefix_entries(cfg)?;
         let inner = Arc::new(BgpServiceInner {
             global_asn: cfg.global.asn,
             router_id,
-            prefixes,
+            prefix_state: RwLock::new(PrefixState::new(prefixes)),
+            session_ops: RwLock::new(HashMap::new()),
             peers: RwLock::new(HashMap::new()),
             rib_in: RwLock::new(HashMap::new()),
             session_local_ips: RwLock::new(HashMap::new()),
@@ -340,6 +584,31 @@ impl BgpService {
             .write()
             .await
             .insert(peer.address.clone(), local_ip);
+        // Runtime route changes reach a session only while it is established;
+        // the receiver is polled from the session loop below.
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<SessionOp>(64);
+        self.inner
+            .session_ops
+            .write()
+            .await
+            .insert(peer.address.clone(), ctrl_tx);
+        let result = self
+            .run_session_inner(peer, stream, local_ip, ctrl_rx)
+            .await;
+        self.inner.session_ops.write().await.remove(&peer.address);
+        result
+    }
+
+    async fn run_session_inner(
+        &self,
+        peer: &PeerConfig,
+        stream: &mut TcpStream,
+        local_ip: IpAddr,
+        mut ctrl_rx: mpsc::Receiver<SessionOp>,
+    ) -> Result<()> {
+        // Split halves let the session write keepalives and runtime updates
+        // while a read is concurrently outstanding inside `select!`.
+        let (mut reader, mut writer) = stream.split();
         self.set_peer_state(&peer.address, PeerState::OpenSent, None, None)
             .await;
 
@@ -351,9 +620,9 @@ impl BgpService {
             hold_time,
             peer.route_refresh,
         );
-        write_bgp_message(stream, &open, AsnLength::Bits32).await?;
+        write_bgp_message(&mut writer, &open, AsnLength::Bits32).await?;
 
-        let incoming = read_bgp_message(stream).await?;
+        let incoming = read_bgp_message(&mut reader).await?;
         let BgpMessage::Open(remote_open) = incoming.message else {
             return Err(anyhow!("expected OPEN from peer"));
         };
@@ -362,8 +631,8 @@ impl BgpService {
 
         self.set_peer_state(&peer.address, PeerState::OpenConfirm, None, None)
             .await;
-        write_bgp_message(stream, &BgpMessage::KeepAlive, AsnLength::Bits32).await?;
-        let incoming = read_bgp_message(stream).await?;
+        write_bgp_message(&mut writer, &BgpMessage::KeepAlive, AsnLength::Bits32).await?;
+        let incoming = read_bgp_message(&mut reader).await?;
         if !matches!(incoming.message, BgpMessage::KeepAlive) {
             return Err(anyhow!("expected KEEPALIVE from peer after OPEN"));
         }
@@ -375,7 +644,7 @@ impl BgpService {
             Some(chrono::Utc::now().timestamp()),
         )
         .await;
-        self.send_prefix_announcements(peer, stream, &negotiated)
+        self.send_prefix_announcements(peer, &mut writer, &negotiated, local_ip)
             .await?;
         // RFC 4271 End-of-RIB: an empty UPDATE per family marks the initial
         // table transfer complete. Vultr's route servers treat a session
@@ -409,7 +678,7 @@ impl BgpService {
                 } else {
                     AsnLength::Bits16
                 };
-                write_bgp_message(stream, &eor, asn_len).await?;
+                write_bgp_message(&mut writer, &eor, asn_len).await?;
             }
         }
 
@@ -420,7 +689,7 @@ impl BgpService {
         loop {
             let now = Instant::now();
             if now >= next_keepalive {
-                write_bgp_message(stream, &BgpMessage::KeepAlive, AsnLength::Bits32).await?;
+                write_bgp_message(&mut writer, &BgpMessage::KeepAlive, AsnLength::Bits32).await?;
                 next_keepalive = now + keepalive_interval;
             }
             if now >= hold_deadline {
@@ -430,31 +699,136 @@ impl BgpService {
                 next_keepalive.saturating_duration_since(now),
                 Duration::from_secs(1),
             );
-            match timeout(timeout_dur, read_bgp_message(stream)).await {
-                Ok(Ok(incoming)) => match incoming.message {
-                    BgpMessage::Update(update) => {
-                        self.ingest_received_update(
-                            peer,
-                            local_as,
-                            local_ip,
-                            update,
-                            incoming.raw,
-                            &negotiated,
-                        )
-                        .await?;
-                        hold_deadline = Instant::now() + negotiated_hold;
+            // Runtime announce/withdraw commands are applied between reads; the
+            // read future is cancel-safe against this branch because both
+            // borrow separate halves of the socket.
+            tokio::select! {
+                biased;
+                op = ctrl_rx.recv() => {
+                    if let Some(op) = op {
+                        self.apply_session_op(peer, &mut writer, &negotiated, local_ip, op)
+                            .await?;
                     }
-                    BgpMessage::KeepAlive | BgpMessage::Open(_) | BgpMessage::RouteRefresh(_) => {
-                        hold_deadline = Instant::now() + negotiated_hold;
+                }
+                result = timeout(timeout_dur, read_bgp_message(&mut reader)) => {
+                    match result {
+                        Ok(Ok(incoming)) => match incoming.message {
+                            BgpMessage::Update(update) => {
+                                self.ingest_received_update(
+                                    peer,
+                                    local_as,
+                                    local_ip,
+                                    update,
+                                    incoming.raw,
+                                    &negotiated,
+                                )
+                                .await?;
+                                hold_deadline = Instant::now() + negotiated_hold;
+                            }
+                            BgpMessage::KeepAlive
+                            | BgpMessage::Open(_)
+                            | BgpMessage::RouteRefresh(_) => {
+                                hold_deadline = Instant::now() + negotiated_hold;
+                            }
+                            BgpMessage::Notification(_) => {
+                                return Err(anyhow!("received NOTIFICATION from peer"))
+                            }
+                        },
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {}
                     }
-                    BgpMessage::Notification(_) => {
-                        return Err(anyhow!("received NOTIFICATION from peer"))
-                    }
-                },
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {}
+                }
             }
         }
+    }
+
+    /// Applies one runtime route change to this session: build, write, archive,
+    /// then refresh the advertised-prefix count for the peer.
+    async fn apply_session_op<W: AsyncWrite + Unpin>(
+        &self,
+        peer: &PeerConfig,
+        writer: &mut W,
+        negotiated: &NegotiatedCapabilities,
+        local_ip: IpAddr,
+        op: SessionOp,
+    ) -> Result<()> {
+        let local_as = peer.local_as.unwrap_or(self.inner.global_asn);
+        let updates = match &op {
+            SessionOp::Announce(entry) => build_announce_updates(
+                std::slice::from_ref(entry),
+                self.inner.router_id,
+                local_ip,
+                local_as,
+                negotiated,
+            ),
+            SessionOp::Withdraw { network } => {
+                build_withdraw_updates(std::slice::from_ref(network), negotiated)
+            }
+        };
+        self.emit_updates(peer, writer, negotiated, local_ip, local_as, updates)
+            .await?;
+        self.refresh_advertised_count(peer, local_ip, local_as, negotiated)
+            .await;
+        Ok(())
+    }
+
+    /// Recomputes how many announcements this session currently carries.
+    async fn refresh_advertised_count(
+        &self,
+        peer: &PeerConfig,
+        local_ip: IpAddr,
+        local_as: u32,
+        negotiated: &NegotiatedCapabilities,
+    ) {
+        let prefixes = self.inner.prefix_state.read().await.effective();
+        let advertised = build_announce_updates(
+            &prefixes,
+            self.inner.router_id,
+            local_ip,
+            local_as,
+            negotiated,
+        )
+        .len();
+        let mut peers = self.inner.peers.write().await;
+        if let Some(runtime) = peers.get_mut(&peer.address) {
+            runtime.info.advertised_prefixes = advertised;
+        }
+    }
+
+    /// Writes updates to one session and mirrors them into the archive. The
+    /// archive is receive-only for a collector, so our own announcements are
+    /// recorded here to keep a self-contained lab archive complete.
+    async fn emit_updates<W: AsyncWrite + Unpin>(
+        &self,
+        peer: &PeerConfig,
+        writer: &mut W,
+        negotiated: &NegotiatedCapabilities,
+        local_ip: IpAddr,
+        local_as: u32,
+        updates: Vec<BgpMessage>,
+    ) -> Result<()> {
+        let asn_len = if negotiated.asn4 {
+            AsnLength::Bits32
+        } else {
+            AsnLength::Bits16
+        };
+        for update in updates {
+            let raw = write_bgp_message(writer, &update, asn_len).await?;
+            if let Some(archive) = &self.inner.archive {
+                archive
+                    .ingest_update(UpdateRecordInput {
+                        timestamp: chrono::Utc::now().timestamp(),
+                        peer_ip: peer.address.parse().context("invalid configured peer IP")?,
+                        peer_asn: peer.remote_as,
+                        local_ip,
+                        local_asn: local_as,
+                        interface_index: 0,
+                        bgp_message: raw,
+                    })
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn ingest_received_update(
@@ -540,47 +914,28 @@ impl BgpService {
         }
     }
 
-    async fn send_prefix_announcements(
+    async fn send_prefix_announcements<W: AsyncWrite + Unpin>(
         &self,
         peer: &PeerConfig,
-        stream: &mut TcpStream,
+        writer: &mut W,
         negotiated: &NegotiatedCapabilities,
+        local_ip: IpAddr,
     ) -> Result<()> {
         let local_as = peer.local_as.unwrap_or(self.inner.global_asn);
-        let local_ip = stream.local_addr()?.ip();
-        for update in build_announce_updates(
-            &self.inner.prefixes,
+        let prefixes = self.inner.prefix_state.read().await.effective();
+        let updates = build_announce_updates(
+            &prefixes,
             self.inner.router_id,
             local_ip,
             local_as,
             negotiated,
-        ) {
-            let asn_len = if negotiated.asn4 {
-                AsnLength::Bits32
-            } else {
-                AsnLength::Bits16
-            };
-            let raw = write_bgp_message(stream, &update, asn_len).await?;
-            // Keep the collector's configured-prefix baseline alongside the
-            // received feed; it lets a self-contained lab archive replay both
-            // sides of this peering session.
-            if let Some(archive) = &self.inner.archive {
-                archive
-                    .ingest_update(UpdateRecordInput {
-                        timestamp: chrono::Utc::now().timestamp(),
-                        peer_ip: peer.address.parse().context("invalid configured peer IP")?,
-                        peer_asn: peer.remote_as,
-                        local_ip,
-                        local_asn: local_as,
-                        interface_index: 0,
-                        bgp_message: raw,
-                    })
-                    .await?;
-            }
-        }
+        );
+        let advertised = updates.len();
+        self.emit_updates(peer, writer, negotiated, local_ip, local_as, updates)
+            .await?;
         let mut peers = self.inner.peers.write().await;
         if let Some(runtime) = peers.get_mut(&peer.address) {
-            runtime.info.advertised_prefixes = self.inner.prefixes.len();
+            runtime.info.advertised_prefixes = advertised;
         }
         Ok(())
     }
@@ -708,6 +1063,155 @@ impl BgpService {
         Ok(())
     }
 
+    /// Effective originated prefix set with provenance and status.
+    pub async fn prefix_view(&self) -> Vec<PrefixView> {
+        self.inner.prefix_state.read().await.view()
+    }
+
+    /// Announces (or re-announces) a prefix at runtime and pushes the update to
+    /// every established session.
+    pub async fn prefix_add(
+        &self,
+        network: IpNet,
+        next_hop: Option<IpAddr>,
+        dry_run: bool,
+    ) -> Result<PrefixMutation> {
+        if let Some(next_hop) = next_hop {
+            ensure_next_hop_family(&network, next_hop)?;
+        }
+        let entry = {
+            let state = self.inner.prefix_state.read().await;
+            PrefixEntry {
+                network,
+                next_hop: next_hop.or_else(|| state.default_next_hop(&network)),
+            }
+        };
+        // A dry run reports what would happen without touching the state.
+        let changed = if dry_run {
+            !self.inner.prefix_state.read().await.is_announced(&network)
+        } else {
+            self.inner.prefix_state.write().await.add(entry.clone())
+        };
+        let peers_notified = if !changed {
+            Vec::new()
+        } else if dry_run {
+            self.session_targets().await
+        } else {
+            self.dispatch_session_op(SessionOp::Announce(entry)).await
+        };
+        let state = self.inner.prefix_state.read().await;
+        Ok(PrefixMutation {
+            action: "announce".to_string(),
+            network: network.to_string(),
+            family: family_name(&network),
+            status: state.status_of(&network),
+            source: state.source_of(&network),
+            changed,
+            dry_run,
+            peers_notified,
+        })
+    }
+
+    /// Withdraws a prefix at runtime: a configured prefix is suppressed, a
+    /// runtime-only one is dropped.
+    pub async fn prefix_remove(&self, network: IpNet, dry_run: bool) -> Result<PrefixMutation> {
+        let changed = if dry_run {
+            self.inner.prefix_state.read().await.is_announced(&network)
+        } else {
+            self.inner.prefix_state.write().await.remove(&network)
+        };
+        let peers_notified = if !changed {
+            Vec::new()
+        } else if dry_run {
+            self.session_targets().await
+        } else {
+            self.dispatch_session_op(SessionOp::Withdraw { network })
+                .await
+        };
+        let state = self.inner.prefix_state.read().await;
+        Ok(PrefixMutation {
+            action: "withdraw".to_string(),
+            network: network.to_string(),
+            family: family_name(&network),
+            status: state.status_of(&network),
+            source: state.source_of(&network),
+            changed,
+            dry_run,
+            peers_notified,
+        })
+    }
+
+    /// Re-reads the configured prefix list, applies the delta, and clears every
+    /// runtime override. Peer sessions and other config sections are untouched.
+    pub async fn reload_prefixes(&self, cfg: &FoclConfig) -> Result<PrefixReload> {
+        let entries = parse_prefix_entries(cfg)?;
+        let (announce, withdraw, overrides_reset) = {
+            let mut state = self.inner.prefix_state.write().await;
+            let overrides_reset = state.override_count();
+            let (announce, withdraw) = state.reset_overrides(entries);
+            (announce, withdraw, overrides_reset)
+        };
+        let mut peers_notified = Vec::new();
+        for entry in announce.iter() {
+            peers_notified.extend(
+                self.dispatch_session_op(SessionOp::Announce(entry.clone()))
+                    .await,
+            );
+        }
+        for network in withdraw.iter() {
+            peers_notified.extend(
+                self.dispatch_session_op(SessionOp::Withdraw { network: *network })
+                    .await,
+            );
+        }
+        peers_notified.sort();
+        peers_notified.dedup();
+        Ok(PrefixReload {
+            announced: announce
+                .iter()
+                .map(|entry| entry.network.to_string())
+                .collect(),
+            withdrawn: withdraw.iter().map(|network| network.to_string()).collect(),
+            overrides_reset,
+            peers_notified,
+        })
+    }
+
+    /// Dispatches one route change to every established session, returning the
+    /// peers whose session accepted it.
+    async fn dispatch_session_op(&self, op: SessionOp) -> Vec<String> {
+        let senders: Vec<(String, mpsc::Sender<SessionOp>)> = self
+            .inner
+            .session_ops
+            .read()
+            .await
+            .iter()
+            .map(|(peer, sender)| (peer.clone(), sender.clone()))
+            .collect();
+        let mut notified = Vec::new();
+        for (peer, sender) in senders {
+            if sender.send(op.clone()).await.is_ok() {
+                notified.push(peer);
+            }
+        }
+        notified.sort();
+        notified
+    }
+
+    /// Established sessions without dispatching anything (`--dry-run`).
+    async fn session_targets(&self) -> Vec<String> {
+        let mut targets: Vec<String> = self
+            .inner
+            .session_ops
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        targets.sort();
+        targets
+    }
+
     pub async fn rib_summary(&self) -> RibSummary {
         let peers = self.inner.peers.read().await;
         RibSummary {
@@ -729,7 +1233,10 @@ impl BgpService {
         }
         Ok(self
             .inner
-            .prefixes
+            .prefix_state
+            .read()
+            .await
+            .effective()
             .iter()
             .map(|prefix| prefix.network.to_string())
             .collect())
@@ -909,6 +1416,56 @@ fn build_announce_updates(
     result
 }
 
+/// Builds the withdrawal updates for one family set. IPv4 withdrawals use the
+/// classic withdrawn-NLRI field; IPv6 withdrawals use MP_UNREACH.
+fn build_withdraw_updates(
+    networks: &[IpNet],
+    negotiated: &NegotiatedCapabilities,
+) -> Vec<BgpMessage> {
+    let mut result = Vec::new();
+    let classic_ipv4_ok = negotiated.plain_ipv4() || negotiated.supports(Afi::Ipv4, Safi::Unicast);
+    let v4: Vec<NetworkPrefix> = networks
+        .iter()
+        .filter(|network| matches!(network, IpNet::V4(_)))
+        .map(|network| NetworkPrefix::new(*network, None))
+        .collect();
+    if classic_ipv4_ok && !v4.is_empty() {
+        result.push(BgpMessage::Update(BgpUpdateMessage {
+            withdrawn_prefixes: v4,
+            attributes: Attributes::default(),
+            announced_prefixes: vec![],
+        }));
+    }
+    if negotiated.supports(Afi::Ipv6, Safi::Unicast) {
+        let v6: Vec<NetworkPrefix> = networks
+            .iter()
+            .filter(|network| matches!(network, IpNet::V6(_)))
+            .map(|network| NetworkPrefix::new(*network, None))
+            .collect();
+        if !v6.is_empty() {
+            let mut attrs = Attributes::default();
+            attrs.add_attr(
+                AttributeValue::MpUnreachNlri(Nlri {
+                    afi: Afi::Ipv6,
+                    safi: Safi::Unicast,
+                    next_hop: None,
+                    prefixes: v6,
+                    labeled_prefixes: None,
+                    link_state_nlris: None,
+                    flowspec_nlris: None,
+                })
+                .into(),
+            );
+            result.push(BgpMessage::Update(BgpUpdateMessage {
+                withdrawn_prefixes: vec![],
+                attributes: attrs,
+                announced_prefixes: vec![],
+            }));
+        }
+    }
+    result
+}
+
 fn base_announce_attributes(local_as: u32) -> Attributes {
     let mut attrs = Attributes::default();
     attrs.add_attr(AttributeValue::Origin(Origin::IGP).into());
@@ -986,8 +1543,8 @@ fn normalize_socket_addr(raw: &str, default_port: u16) -> Result<SocketAddr> {
     Ok(SocketAddr::new(address, default_port))
 }
 
-async fn write_bgp_message(
-    stream: &mut TcpStream,
+async fn write_bgp_message<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     message: &BgpMessage,
     asn_len: AsnLength,
 ) -> Result<Vec<u8>> {
@@ -1003,7 +1560,7 @@ async fn write_bgp_message(
     Ok(bytes)
 }
 
-async fn read_bgp_message(stream: &mut TcpStream) -> Result<ReceivedMessage> {
+async fn read_bgp_message<R: AsyncRead + Unpin>(stream: &mut R) -> Result<ReceivedMessage> {
     let mut header = [0u8; 19];
     stream.read_exact(&mut header).await?;
     if header[0..16] != [0xff; 16] {
@@ -1119,29 +1676,226 @@ mod tests {
     }
 
     #[test]
-    fn v6_announcements_use_mp_reach_not_classic_nlri() {
-        let prefixes = vec![PrefixEntry {
-            network: "2001:db8::/32".parse().unwrap(),
-            next_hop: Some("2001:db8::1".parse().unwrap()),
-        }];
-        let mut negotiated = NegotiatedCapabilities::default();
-        negotiated.families.insert((Afi::Ipv6, Safi::Unicast));
-        let updates = build_announce_updates(
-            &prefixes,
-            Ipv4Addr::new(192, 0, 2, 1),
-            "2001:db8::2".parse().unwrap(),
-            65_001,
-            &negotiated,
-        );
-        let BgpMessage::Update(update) = &updates[0] else {
-            panic!()
-        };
-        assert!(update.announced_prefixes.is_empty());
+    fn prefix_state_layers_runtime_overrides_over_config() {
+        let config = vec![
+            PrefixEntry {
+                network: "192.0.2.0/24".parse().unwrap(),
+                next_hop: Some("192.0.2.1".parse().unwrap()),
+            },
+            PrefixEntry {
+                network: "2001:db8::/48".parse().unwrap(),
+                next_hop: None,
+            },
+        ];
+        let v6: IpNet = "2001:db8::/48".parse().unwrap();
+        let mut state = PrefixState::new(config);
+
+        // Suppressing a configured prefix withdraws it from the effective set.
+        assert!(state.remove(&v6));
+        assert_eq!(state.effective().len(), 1);
+        assert_eq!(state.status_of(&v6), PrefixStatus::Suppressed);
+        assert_eq!(state.source_of(&v6), PrefixSource::Config);
+        // Removing it again changes nothing.
+        assert!(!state.remove(&v6));
+
+        // Re-adding restores the config entry without duplicating it.
+        assert!(state.add(PrefixEntry {
+            network: v6,
+            next_hop: None,
+        }));
+        assert_eq!(state.effective().len(), 2);
+        assert_eq!(state.override_count(), 0);
+
+        // A runtime-only entry is added and dropped without residue.
+        let runtime_only: IpNet = "198.51.100.0/24".parse().unwrap();
+        assert!(state.add(PrefixEntry {
+            network: runtime_only,
+            next_hop: None,
+        }));
+        assert_eq!(state.source_of(&runtime_only), PrefixSource::Runtime);
+        assert_eq!(state.status_of(&runtime_only), PrefixStatus::Announced);
+        assert!(state.remove(&runtime_only));
+        assert_eq!(state.status_of(&runtime_only), PrefixStatus::Absent);
+        assert_eq!(state.override_count(), 0);
+    }
+
+    #[test]
+    fn reload_resets_overrides_and_reports_the_delta() {
+        let suppressed: IpNet = "192.0.2.0/24".parse().unwrap();
+        let runtime_only: IpNet = "198.51.100.0/24".parse().unwrap();
+        let mut state = PrefixState::new(vec![PrefixEntry {
+            network: suppressed,
+            next_hop: None,
+        }]);
+        assert!(state.remove(&suppressed));
+        assert!(state.add(PrefixEntry {
+            network: runtime_only,
+            next_hop: None,
+        }));
+
+        let added: IpNet = "203.0.113.0/24".parse().unwrap();
+        let (announce, withdraw) = state.reset_overrides(vec![PrefixEntry {
+            network: added,
+            next_hop: None,
+        }]);
+
         assert_eq!(
-            update.attributes.get_reachable_nlri().unwrap().prefixes[0]
-                .prefix
-                .to_string(),
-            "2001:db8::/32"
+            announce
+                .iter()
+                .map(|entry| entry.network.to_string())
+                .collect::<Vec<_>>(),
+            vec!["203.0.113.0/24"]
         );
+        // The suppressed config prefix was not announced before the reload, so
+        // only the runtime addition needs withdrawing.
+        assert_eq!(
+            withdraw
+                .iter()
+                .map(|network| network.to_string())
+                .collect::<Vec<_>>(),
+            vec!["198.51.100.0/24"]
+        );
+        assert_eq!(state.override_count(), 0);
+    }
+
+    #[test]
+    fn reload_re_announces_a_suppressed_prefix() {
+        let entry = PrefixEntry {
+            network: "2620:aa:a000::/48".parse().unwrap(),
+            next_hop: None,
+        };
+        let mut state = PrefixState::new(vec![entry.clone()]);
+        assert!(state.remove(&entry.network));
+        assert!(state.effective().is_empty());
+
+        // An unchanged config re-announces what the operator suppressed.
+        let (announce, withdraw) = state.reset_overrides(vec![entry.clone()]);
+        assert_eq!(announce.len(), 1);
+        assert!(withdraw.is_empty());
+        assert_eq!(state.status_of(&entry.network), PrefixStatus::Announced);
+    }
+
+    #[test]
+    fn withdraw_updates_use_withdrawn_nlri_for_v4_and_mp_unreach_for_v6() {
+        let networks: Vec<IpNet> = vec![
+            "192.0.2.0/24".parse().unwrap(),
+            "2001:db8::/48".parse().unwrap(),
+        ];
+        let negotiated = NegotiatedCapabilities {
+            families: HashSet::from([(Afi::Ipv4, Safi::Unicast), (Afi::Ipv6, Safi::Unicast)]),
+            ..Default::default()
+        };
+        let updates = build_withdraw_updates(&networks, &negotiated);
+        assert_eq!(updates.len(), 2);
+
+        let BgpMessage::Update(v4) = &updates[0] else {
+            panic!("not an UPDATE")
+        };
+        assert_eq!(v4.withdrawn_prefixes.len(), 1);
+        assert_eq!(v4.withdrawn_prefixes[0].prefix.to_string(), "192.0.2.0/24");
+        assert!(v4.announced_prefixes.is_empty());
+
+        let BgpMessage::Update(v6) = &updates[1] else {
+            panic!("not an UPDATE")
+        };
+        assert!(v6.withdrawn_prefixes.is_empty());
+        let unreach = v6
+            .attributes
+            .get_unreachable_nlri()
+            .expect("MP_UNREACH present");
+        assert_eq!(unreach.afi, Afi::Ipv6);
+        assert_eq!(unreach.prefixes.len(), 1);
+        assert_eq!(unreach.prefixes[0].prefix.to_string(), "2001:db8::/48");
+    }
+
+    #[test]
+    fn withdraw_and_announce_respect_negotiated_families() {
+        let v6: IpNet = "2001:db8::/48".parse().unwrap();
+        let v4_only = NegotiatedCapabilities {
+            families: HashSet::from([(Afi::Ipv4, Safi::Unicast)]),
+            ..Default::default()
+        };
+        assert!(build_withdraw_updates(&[v6], &v4_only).is_empty());
+        assert!(build_announce_updates(
+            &[PrefixEntry {
+                network: v6,
+                next_hop: None,
+            }],
+            Ipv4Addr::new(192, 0, 2, 1),
+            "192.0.2.2".parse().unwrap(),
+            65_001,
+            &v4_only,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn next_hop_family_mismatch_is_rejected() {
+        let v6: IpNet = "2001:db8::/48".parse().unwrap();
+        assert!(ensure_next_hop_family(&v6, "192.0.2.1".parse().unwrap()).is_err());
+        assert!(ensure_next_hop_family(&v6, "2001:db8::1".parse().unwrap()).is_ok());
+    }
+
+    fn test_service_config() -> FoclConfig {
+        toml::from_str(
+            r#"
+[global]
+asn = 65001
+router_id = "10.0.0.1"
+listen = false
+control_socket = "/tmp/focl-test-only.sock"
+
+[archive]
+enabled = false
+"#,
+        )
+        .expect("test config parses")
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_without_changing_state() {
+        let cfg = test_service_config();
+        let (event_tx, _) = broadcast::channel::<EventEnvelope>(4);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+        let network: IpNet = "192.0.2.0/24".parse().unwrap();
+
+        let dry_add = service.prefix_add(network, None, true).await.unwrap();
+        assert!(dry_add.changed && dry_add.dry_run);
+        assert!(
+            service.prefix_view().await.is_empty(),
+            "a dry run must not originate the prefix"
+        );
+
+        let applied = service.prefix_add(network, None, false).await.unwrap();
+        assert!(applied.changed && !applied.dry_run);
+        assert_eq!(service.prefix_view().await.len(), 1);
+
+        let dry_remove = service.prefix_remove(network, true).await.unwrap();
+        assert!(dry_remove.changed && dry_remove.dry_run);
+        assert_eq!(
+            service.prefix_view().await.len(),
+            1,
+            "a dry run must not withdraw the prefix"
+        );
+
+        let removed = service.prefix_remove(network, false).await.unwrap();
+        assert!(removed.changed);
+        assert!(service.prefix_view().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefix_add_rejects_a_mismatched_next_hop() {
+        let cfg = test_service_config();
+        let (event_tx, _) = broadcast::channel::<EventEnvelope>(4);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+        let network: IpNet = "2001:db8::/48".parse().unwrap();
+        let error = service
+            .prefix_add(network, Some("192.0.2.1".parse().unwrap()), false)
+            .await
+            .expect_err("IPv4 next hop on an IPv6 prefix must be rejected");
+        assert!(error
+            .to_string()
+            .contains("does not match the prefix family"));
+        assert!(service.prefix_view().await.is_empty());
     }
 }

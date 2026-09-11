@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,8 +8,11 @@ use focl::archive::types::ArchiveStream;
 use focl::archive::ArchiveService;
 use focl::bgp::BgpService;
 use focl::config::FoclConfig;
-use focl::control::{ArchiveRolloverArgs, ArchiveStatusResult, CommandKind, PeerKeyArgs};
+use focl::control::{
+    ArchiveRolloverArgs, ArchiveStatusResult, CommandKind, PeerKeyArgs, PrefixMutationArgs,
+};
 use focl::types::{ControlRequest, ControlResponse};
+use ipnet::IpNet;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -52,7 +56,10 @@ async fn main() -> Result<()> {
         let archive = Arc::clone(&archive);
         let bgp = bgp.clone();
         let shutdown_tx = shutdown_tx.clone();
-        tokio::spawn(async move { run_control_server(listener, archive, bgp, shutdown_tx).await })
+        let config_path = Arc::new(args.config.clone());
+        tokio::spawn(async move {
+            run_control_server(listener, archive, bgp, shutdown_tx, config_path).await
+        })
     };
 
     tokio::select! {
@@ -95,15 +102,17 @@ async fn run_control_server(
     archive: Arc<ArchiveService>,
     bgp: BgpService,
     shutdown_tx: broadcast::Sender<()>,
+    config_path: Arc<PathBuf>,
 ) -> Result<()> {
     loop {
         let (stream, _addr) = listener.accept().await?;
         let archive = Arc::clone(&archive);
         let bgp = bgp.clone();
         let shutdown_tx = shutdown_tx.clone();
+        let config_path = Arc::clone(&config_path);
 
         tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, archive, bgp, shutdown_tx).await {
+            if let Err(err) = handle_client(stream, archive, bgp, shutdown_tx, config_path).await {
                 tracing::warn!(error=%err, "control connection failed");
             }
         });
@@ -115,6 +124,7 @@ async fn handle_client(
     archive: Arc<ArchiveService>,
     bgp: BgpService,
     shutdown_tx: broadcast::Sender<()>,
+    config_path: Arc<PathBuf>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -153,7 +163,26 @@ async fn handle_client(
                     }),
                 )
             }
-            CommandKind::Reload => ControlResponse::ok(req.id, json!({"reloaded": true})),
+            CommandKind::Reload => match FoclConfig::load(&config_path) {
+                Ok(cfg) => match bgp.reload_prefixes(&cfg).await {
+                    Ok(reload) => ControlResponse::ok(
+                        req.id,
+                        json!({
+                            "reloaded": true,
+                            // Only the originated prefix set is re-applied; peer
+                            // and archive settings still require a restart.
+                            "scope": "prefixes",
+                            "prefixes": reload,
+                        }),
+                    ),
+                    Err(err) => ControlResponse::err(req.id, "reload_failed", err.to_string()),
+                },
+                Err(err) => ControlResponse::err(
+                    req.id,
+                    "config_invalid",
+                    format!("failed reading {}: {err}", config_path.display()),
+                ),
+            },
             CommandKind::Shutdown => {
                 let _ = shutdown_tx.send(());
                 ControlResponse::ok(req.id, json!({"shutting_down": true}))
@@ -265,6 +294,30 @@ async fn handle_client(
                     Err(err) => ControlResponse::err(req.id, "peer_reset_failed", err.to_string()),
                 }
             }
+            CommandKind::PrefixList => {
+                let prefixes = bgp.prefix_view().await;
+                ControlResponse::ok(req.id, json!({"prefixes": prefixes}))
+            }
+            CommandKind::PrefixAdd => match parse_prefix_mutation_args(&req, "prefix_add") {
+                Ok((network, next_hop, dry_run)) => {
+                    match bgp.prefix_add(network, next_hop, dry_run).await {
+                        Ok(mutation) => ControlResponse::ok(req.id, json!(mutation)),
+                        Err(err) => {
+                            ControlResponse::err(req.id, "prefix_add_failed", err.to_string())
+                        }
+                    }
+                }
+                Err(response) => response,
+            },
+            CommandKind::PrefixRemove => match parse_prefix_mutation_args(&req, "prefix_remove") {
+                Ok((network, _, dry_run)) => match bgp.prefix_remove(network, dry_run).await {
+                    Ok(mutation) => ControlResponse::ok(req.id, json!(mutation)),
+                    Err(err) => {
+                        ControlResponse::err(req.id, "prefix_remove_failed", err.to_string())
+                    }
+                },
+                Err(response) => response,
+            },
             CommandKind::RibSummary => {
                 let summary = bgp.rib_summary().await;
                 ControlResponse::ok(req.id, json!({"summary": summary}))
@@ -349,4 +402,48 @@ async fn write_response(
     writer.write_all(payload.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     Ok(())
+}
+
+/// Parses `prefix_add` / `prefix_remove` arguments, returning a ready-made
+/// error response instead of failing the whole control connection.
+fn parse_prefix_mutation_args(
+    req: &ControlRequest,
+    label: &str,
+) -> std::result::Result<(IpNet, Option<IpAddr>, bool), ControlResponse> {
+    let args = match PrefixMutationArgs::from_json(&req.args) {
+        Ok(args) => args,
+        Err(err) => {
+            return Err(ControlResponse::err(
+                req.id.clone(),
+                "invalid_args",
+                format!("{label} args error: {err}"),
+            ))
+        }
+    };
+    let network = match args.network.parse::<IpNet>() {
+        Ok(network) => network,
+        Err(err) => {
+            return Err(ControlResponse::err(
+                req.id.clone(),
+                "invalid_network",
+                format!("{label} network error: {err}"),
+            ))
+        }
+    };
+    let next_hop = match args
+        .next_hop
+        .as_deref()
+        .map(str::parse::<IpAddr>)
+        .transpose()
+    {
+        Ok(next_hop) => next_hop,
+        Err(err) => {
+            return Err(ControlResponse::err(
+                req.id.clone(),
+                "invalid_next_hop",
+                format!("{label} next hop error: {err}"),
+            ))
+        }
+    };
+    Ok((network, next_hop, args.dry_run))
 }
