@@ -248,6 +248,7 @@ cargo clippy --no-default-features
 |--------|------|---------|-------------|
 | `network` | string | required | IP prefix (v4 or v6) |
 | `next_hop` | string | auto | Next-hop address |
+| `dev_attr255_interval_secs` | u32 | none | Attach attribute 255 (reserved for development) with a BGPKIT clock payload, re-announced every N seconds |
 
 ## License
 

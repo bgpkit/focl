@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use bgpkit_parser::bgp::parse_bgp_message;
 use bgpkit_parser::models::{
-    Afi, AsPath, Asn, AsnLength, AttributeValue, Attributes, BgpMessage, BgpOpenMessage,
-    BgpUpdateMessage, NetworkPrefix, Nlri, OptParam, Origin, ParamValue, Safi,
+    Afi, AsPath, Asn, AsnLength, AttrFlags, Attribute, AttributeValue, Attributes, BgpMessage,
+    BgpOpenMessage, BgpUpdateMessage, NetworkPrefix, Nlri, OptParam, Origin, ParamValue, Safi,
 };
 use bytes::Bytes;
 use ipnet::IpNet;
@@ -63,6 +63,9 @@ struct PeerRuntime {
 struct PrefixEntry {
     network: IpNet,
     next_hop: Option<IpAddr>,
+    /// Attribute-255 clock refresh interval in seconds, when this prefix
+    /// carries the development attribute clock.
+    dev_attr255_interval_secs: Option<u32>,
 }
 
 /// Where an originated prefix comes from: the config baseline or a runtime
@@ -235,6 +238,16 @@ impl PrefixState {
             .find(|address| address.is_ipv4() == wants_v4)
     }
 
+    /// Configured attribute-255 clock interval for the network, if any. Like
+    /// `default_next_hop`, only the config baseline is consulted, so a runtime
+    /// add for a configured network keeps the configured clock.
+    fn configured_attr255_interval(&self, network: &IpNet) -> Option<u32> {
+        self.config
+            .iter()
+            .find(|entry| entry.network == *network)
+            .and_then(|entry| entry.dev_attr255_interval_secs)
+    }
+
     fn view(&self) -> Vec<PrefixView> {
         let mut rows: Vec<PrefixView> = self
             .config
@@ -342,7 +355,11 @@ fn parse_prefix_entries(cfg: &FoclConfig) -> Result<Vec<PrefixEntry>> {
                 .map(|nh| nh.parse::<IpAddr>())
                 .transpose()
                 .with_context(|| format!("invalid next-hop address: {:?}", p.next_hop))?;
-            Ok::<_, anyhow::Error>(PrefixEntry { network, next_hop })
+            Ok::<_, anyhow::Error>(PrefixEntry {
+                network,
+                next_hop,
+                dev_attr255_interval_secs: p.dev_attr255_interval_secs,
+            })
         })
         .collect::<Result<Vec<_>, _>>()
         .context("invalid prefix in config")
@@ -454,6 +471,7 @@ impl BgpService {
         if cfg.global.listen {
             service.start_listener(&cfg.global.listen_addr).await?;
         }
+        service.start_clock_refresh().await;
         Ok(service)
     }
 
@@ -515,6 +533,47 @@ impl BgpService {
             }
         });
         Ok(())
+    }
+
+    /// Re-announces every configured attribute-255 clock prefix on its own
+    /// interval. The effective set is re-read on each tick, so a runtime
+    /// suppression is respected without touching the task; intervals
+    /// introduced by a later `reload` are only scheduled after a restart.
+    async fn start_clock_refresh(&self) {
+        let intervals: BTreeSet<u32> = self
+            .inner
+            .prefix_state
+            .read()
+            .await
+            .effective()
+            .iter()
+            .filter_map(|entry| entry.dev_attr255_interval_secs)
+            .collect();
+        for interval in intervals {
+            let service = self.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(u64::from(interval)));
+                // The establishment announcement already covers t0.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let entries: Vec<PrefixEntry> = service
+                        .inner
+                        .prefix_state
+                        .read()
+                        .await
+                        .effective()
+                        .into_iter()
+                        .filter(|entry| entry.dev_attr255_interval_secs == Some(interval))
+                        .collect();
+                    for entry in entries {
+                        let _ = service
+                            .dispatch_session_op(SessionOp::Announce(entry))
+                            .await;
+                    }
+                }
+            });
+        }
     }
 
     async fn accept_inbound(&self, stream: TcpStream, remote: SocketAddr) {
@@ -1165,6 +1224,7 @@ impl BgpService {
             PrefixEntry {
                 network,
                 next_hop: next_hop.or_else(|| state.default_next_hop(&network)),
+                dev_attr255_interval_secs: state.configured_attr255_interval(&network),
             }
         };
         // A dry run reports what would happen without touching the state.
@@ -1462,6 +1522,7 @@ fn build_announce_updates(
     local_as: u32,
     negotiated: &NegotiatedCapabilities,
 ) -> Vec<BgpMessage> {
+    let now = unix_now();
     let mut result = Vec::new();
     let plain_ipv4 = negotiated.plain_ipv4();
     for prefix in prefixes
@@ -1472,6 +1533,7 @@ fn build_announce_updates(
             let mut attrs = base_announce_attributes(local_as);
             let next_hop = prefix.next_hop.unwrap_or(IpAddr::V4(router_id));
             attrs.add_attr(AttributeValue::NextHop(next_hop).into());
+            attach_dev_attr255(&mut attrs, prefix, now);
             result.push(BgpMessage::Update(BgpUpdateMessage {
                 withdrawn_prefixes: vec![],
                 attributes: attrs,
@@ -1499,6 +1561,7 @@ fn build_announce_updates(
         };
         let nlri = Nlri::new_reachable(NetworkPrefix::new(prefix.network, None), Some(next_hop));
         attrs.add_attr(AttributeValue::MpReachNlri(nlri).into());
+        attach_dev_attr255(&mut attrs, prefix, now);
         result.push(BgpMessage::Update(BgpUpdateMessage {
             withdrawn_prefixes: vec![],
             attributes: attrs,
@@ -1574,6 +1637,42 @@ fn base_announce_attributes(local_as: u32) -> Attributes {
         .into(),
     );
     attrs
+}
+
+/// Attribute-255 development clock: magic bytes, format version, refresh
+/// round, and the low 32 bits of the unix time.
+const DEV_ATTR255_MAGIC: &[u8] = b"BGPKIT";
+const DEV_ATTR255_VERSION: u8 = 1;
+
+fn dev_attr255_clock_payload(unix_secs: u64, interval_secs: u32) -> Vec<u8> {
+    let interval = u64::from(interval_secs).max(1);
+    let round = ((unix_secs / interval) % 65_536) as u16;
+    let mut payload = Vec::with_capacity(13);
+    payload.extend_from_slice(DEV_ATTR255_MAGIC);
+    payload.push(DEV_ATTR255_VERSION);
+    payload.extend_from_slice(&round.to_be_bytes());
+    payload.extend_from_slice(&(unix_secs as u32).to_be_bytes());
+    payload
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Attaches the attribute-255 clock when the prefix carries one. The flag is
+/// OPTIONAL|TRANSITIVE: `Development`'s `.into()` default would also set the
+/// PARTIAL bit (0xe0), which an originating speaker must not send.
+fn attach_dev_attr255(attrs: &mut Attributes, prefix: &PrefixEntry, now: u64) {
+    let Some(interval) = prefix.dev_attr255_interval_secs else {
+        return;
+    };
+    attrs.add_attr(Attribute {
+        value: AttributeValue::Development(dev_attr255_clock_payload(now, interval)),
+        flag: AttrFlags::OPTIONAL | AttrFlags::TRANSITIVE,
+    });
 }
 
 fn peer_state_code(state: PeerState) -> u16 {
@@ -1722,6 +1821,7 @@ mod tests {
         let prefixes = vec![PrefixEntry {
             network: "192.0.2.0/24".parse().unwrap(),
             next_hop: None,
+            dev_attr255_interval_secs: None,
         }];
 
         let negotiated = NegotiatedCapabilities {
@@ -1784,10 +1884,12 @@ mod tests {
             PrefixEntry {
                 network: "192.0.2.0/24".parse().unwrap(),
                 next_hop: Some("192.0.2.1".parse().unwrap()),
+                dev_attr255_interval_secs: None,
             },
             PrefixEntry {
                 network: "2001:db8::/48".parse().unwrap(),
                 next_hop: None,
+                dev_attr255_interval_secs: None,
             },
         ];
         let v6: IpNet = "2001:db8::/48".parse().unwrap();
@@ -1805,6 +1907,7 @@ mod tests {
         assert!(state.add(PrefixEntry {
             network: v6,
             next_hop: None,
+            dev_attr255_interval_secs: None,
         }));
         assert_eq!(state.effective().len(), 2);
         assert_eq!(state.override_count(), 0);
@@ -1814,6 +1917,7 @@ mod tests {
         assert!(state.add(PrefixEntry {
             network: runtime_only,
             next_hop: None,
+            dev_attr255_interval_secs: None,
         }));
         assert_eq!(state.source_of(&runtime_only), Some(PrefixSource::Runtime));
         assert_eq!(state.status_of(&runtime_only), PrefixStatus::Announced);
@@ -1829,17 +1933,20 @@ mod tests {
         let mut state = PrefixState::new(vec![PrefixEntry {
             network: suppressed,
             next_hop: None,
+            dev_attr255_interval_secs: None,
         }]);
         assert!(state.remove(&suppressed));
         assert!(state.add(PrefixEntry {
             network: runtime_only,
             next_hop: None,
+            dev_attr255_interval_secs: None,
         }));
 
         let added: IpNet = "203.0.113.0/24".parse().unwrap();
         let (announce, withdraw) = state.reset_overrides(vec![PrefixEntry {
             network: added,
             next_hop: None,
+            dev_attr255_interval_secs: None,
         }]);
 
         assert_eq!(
@@ -1866,6 +1973,7 @@ mod tests {
         let entry = PrefixEntry {
             network: "2620:aa:a000::/48".parse().unwrap(),
             next_hop: None,
+            dev_attr255_interval_secs: None,
         };
         let mut state = PrefixState::new(vec![entry.clone()]);
         assert!(state.remove(&entry.network));
@@ -1923,6 +2031,7 @@ mod tests {
             &[PrefixEntry {
                 network: v6,
                 next_hop: None,
+                dev_attr255_interval_secs: None,
             }],
             Ipv4Addr::new(192, 0, 2, 1),
             "192.0.2.2".parse().unwrap(),
@@ -1949,16 +2058,19 @@ mod tests {
         assert!(state.add(PrefixEntry {
             network,
             next_hop: Some(first),
+            dev_attr255_interval_secs: None,
         }));
         // Same next hop again: nothing to announce.
         assert!(!state.add(PrefixEntry {
             network,
             next_hop: Some(first),
+            dev_attr255_interval_secs: None,
         }));
         // A different next hop must re-announce, and the effective entry follows.
         assert!(state.add(PrefixEntry {
             network,
             next_hop: Some(second),
+            dev_attr255_interval_secs: None,
         }));
         let effective = state.effective();
         assert_eq!(effective.len(), 1);
@@ -1973,15 +2085,18 @@ mod tests {
         let mut state = PrefixState::new(vec![PrefixEntry {
             network,
             next_hop: Some(configured),
+            dev_attr255_interval_secs: None,
         }]);
 
         assert!(!state.add(PrefixEntry {
             network,
             next_hop: Some(configured),
+            dev_attr255_interval_secs: None,
         }));
         assert!(state.add(PrefixEntry {
             network,
             next_hop: Some(override_hop),
+            dev_attr255_interval_secs: None,
         }));
         let effective = state.effective();
         assert_eq!(
@@ -1999,6 +2114,7 @@ mod tests {
         let mut state = PrefixState::new(vec![PrefixEntry {
             network: v4,
             next_hop: Some("10.0.0.1".parse().unwrap()),
+            dev_attr255_interval_secs: None,
         }]);
 
         assert_eq!(
@@ -2011,8 +2127,185 @@ mod tests {
         state.add(PrefixEntry {
             network: v6,
             next_hop: Some("2001:db8::1".parse().unwrap()),
+            dev_attr255_interval_secs: None,
         });
         assert_eq!(state.default_next_hop(&v6), None);
+    }
+
+    #[test]
+    fn dev_attr255_clock_payload_is_a_fixed_13_byte_vector() {
+        let payload = dev_attr255_clock_payload(1_800_000_000, 1800);
+        assert_eq!(payload.len(), 13);
+        assert_eq!(
+            payload,
+            vec![
+                0x42, 0x47, 0x50, 0x4b, 0x49, 0x54, // "BGPKIT"
+                0x01, // version
+                0x42, 0x40, // round = (1_800_000_000 / 1800) % 65_536
+                0x6b, 0x49, 0xd2, 0x00, // 1_800_000_000 as u32
+            ]
+        );
+
+        // The round field wraps at 65_536: `unix / interval` is taken mod
+        // 65_536, so it cycles with period 65_536 * interval and stays small
+        // for large unix values.
+        let at_wrap: u64 = 65_536 * 1800;
+        let first = dev_attr255_clock_payload(at_wrap, 1800);
+        assert_eq!(&first[7..9], &[0x00, 0x00][..]);
+        let after_wrap = dev_attr255_clock_payload(at_wrap + 1800, 1800);
+        assert_eq!(&after_wrap[7..9], &[0x00, 0x01][..]);
+        // A full period later the round repeats while the unix field advances.
+        let period = dev_attr255_clock_payload(1_800_000_000 + at_wrap, 1800);
+        assert_eq!(&period[7..9], &[0x42, 0x40][..]);
+
+        // A zero interval cannot come from a validated config, but the payload
+        // builder must not divide by zero if one reaches it.
+        assert_eq!(dev_attr255_clock_payload(1_800_000_000, 0).len(), 13);
+    }
+
+    #[test]
+    fn announce_updates_carry_the_attribute_255_clock_only_when_configured() {
+        // Walks the encoded attribute list into (flags, code, value) triples.
+        fn attributes_of(message: &BgpMessage, asn_len: AsnLength) -> Vec<(u8, u8, Vec<u8>)> {
+            let BgpMessage::Update(update) = message else {
+                panic!("not an UPDATE")
+            };
+            let mut buf = bytes::BytesMut::new();
+            update.attributes.encode_to(asn_len, &mut buf).unwrap();
+            let mut attrs = Vec::new();
+            let mut p = 0;
+            while p < buf.len() {
+                let flags = buf[p];
+                let code = buf[p + 1];
+                let (length, header) = if flags & 0x10 != 0 {
+                    (u16::from_be_bytes([buf[p + 2], buf[p + 3]]) as usize, 4)
+                } else {
+                    (buf[p + 2] as usize, 3)
+                };
+                attrs.push((flags, code, buf[p + header..p + header + length].to_vec()));
+                p += header + length;
+            }
+            attrs
+        }
+
+        let negotiated = NegotiatedCapabilities {
+            families: HashSet::from([(Afi::Ipv4, Safi::Unicast), (Afi::Ipv6, Safi::Unicast)]),
+            asn4: true,
+            ..Default::default()
+        };
+        let router_id = Ipv4Addr::new(192, 0, 2, 1);
+        let v6_local: IpAddr = "2001:db8::2".parse().unwrap();
+        let v4 = PrefixEntry {
+            network: "192.0.2.0/24".parse().unwrap(),
+            next_hop: None,
+            dev_attr255_interval_secs: Some(1800),
+        };
+        let v6 = PrefixEntry {
+            network: "2001:db8::/48".parse().unwrap(),
+            next_hop: None,
+            dev_attr255_interval_secs: Some(1800),
+        };
+
+        // 0xc0 flags (OPTIONAL|TRANSITIVE, no PARTIAL), code 255, length 13,
+        // then the BGPKIT magic and the version octet.
+        let expected = [0xc0u8, 0xff, 0x0d, 0x42, 0x47, 0x50, 0x4b, 0x49, 0x54, 0x01];
+        let v4_update = build_announce_updates(
+            std::slice::from_ref(&v4),
+            router_id,
+            IpAddr::V4(router_id),
+            65_001,
+            &negotiated,
+        )
+        .remove(0);
+        let v6_update = build_announce_updates(
+            std::slice::from_ref(&v6),
+            router_id,
+            v6_local,
+            65_001,
+            &negotiated,
+        )
+        .remove(0);
+
+        for update in [&v4_update, &v6_update] {
+            let raw = update.encode(AsnLength::Bits32).unwrap();
+            assert!(
+                raw.windows(expected.len())
+                    .any(|window| window == &expected[..]),
+                "expected the flagged attribute-255 clock on the wire"
+            );
+            let clock = attributes_of(update, AsnLength::Bits32)
+                .into_iter()
+                .find(|(_, code, _)| *code == 255)
+                .expect("development attribute present");
+            assert_eq!(clock.0, 0xc0, "OPTIONAL|TRANSITIVE, no PARTIAL bit");
+            assert_eq!(clock.2.len(), 13);
+            assert!(clock.2.starts_with(b"BGPKIT\x01"));
+        }
+
+        // Parsing the v4 message back keeps the originating flags.
+        let mut parsed_bytes = v4_update.encode(AsnLength::Bits32).unwrap();
+        let parsed = parse_bgp_message(&mut parsed_bytes, false, &AsnLength::Bits32).unwrap();
+        let BgpMessage::Update(parsed_update) = parsed else {
+            panic!("not an UPDATE")
+        };
+        let clock = parsed_update
+            .attributes
+            .clone()
+            .into_attributes_iter()
+            .find(|attribute| matches!(attribute.value, AttributeValue::Development(_)))
+            .expect("parsed development attribute");
+        assert!(clock.flag.contains(AttrFlags::OPTIONAL));
+        assert!(clock.flag.contains(AttrFlags::TRANSITIVE));
+        assert!(!clock.flag.contains(AttrFlags::PARTIAL));
+
+        // Without a configured interval the attribute must not appear at all.
+        let mut plain = [v4.clone(), v6.clone()];
+        for entry in &mut plain {
+            entry.dev_attr255_interval_secs = None;
+        }
+        let updates = build_announce_updates(&plain, router_id, v6_local, 65_001, &negotiated);
+        assert_eq!(updates.len(), 2);
+        for update in &updates {
+            let raw = update.encode(AsnLength::Bits32).unwrap();
+            assert!(
+                !raw.windows(expected.len())
+                    .any(|window| window == &expected[..]),
+                "an unconfigured prefix must not carry the development attribute"
+            );
+            assert!(attributes_of(update, AsnLength::Bits32)
+                .iter()
+                .all(|(_, code, _)| *code != 255));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_readd_keeps_the_configured_clock() {
+        use crate::config::PrefixConfig;
+
+        let network: IpNet = "2001:db8::/48".parse().unwrap();
+        let mut cfg = test_service_config();
+        cfg.prefixes.push(PrefixConfig {
+            network: network.to_string(),
+            next_hop: Some("2001:db8::1".to_string()),
+            dev_attr255_interval_secs: Some(3600),
+        });
+        let (event_tx, _) = broadcast::channel::<EventEnvelope>(4);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+
+        assert!(service.prefix_remove(network, false).await.unwrap().changed);
+        let added = service.prefix_add(network, None, false).await.unwrap();
+        assert!(added.changed);
+
+        let entry = service
+            .inner
+            .prefix_state
+            .read()
+            .await
+            .effective()
+            .into_iter()
+            .find(|entry| entry.network == network)
+            .expect("the re-added prefix is effective again");
+        assert_eq!(entry.dev_attr255_interval_secs, Some(3600));
     }
 
     fn test_service_config() -> FoclConfig {

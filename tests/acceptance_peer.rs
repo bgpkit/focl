@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bgpkit_parser::bgp::parse_bgp_message;
 use bgpkit_parser::models::{
-    AsPath, Asn, AsnLength, AttributeValue, Attributes, BgpMessage, BgpOpenMessage,
+    AsPath, Asn, AsnLength, AttrFlags, AttributeValue, Attributes, BgpMessage, BgpOpenMessage,
     BgpUpdateMessage, NetworkPrefix, Nlri, OptParam, Origin, ParamValue,
 };
 use bgpkit_parser::parse_mrt_record;
@@ -25,6 +25,8 @@ use tokio::time::timeout;
 
 const PEER_AS: u32 = 65_002;
 const FOCL_AS: u32 = 65_001;
+/// The IPv6 prefix carrying the attribute-255 clock in the clock tests.
+const CLOCK_PREFIX: &str = "2001:db8:feed::/48";
 
 #[tokio::test]
 async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()> {
@@ -59,10 +61,12 @@ async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()
             PrefixConfig {
                 network: "198.51.100.0/24".to_string(),
                 next_hop: Some("192.0.2.1".to_string()),
+                dev_attr255_interval_secs: None,
             },
             PrefixConfig {
                 network: "2001:db8:feed::/48".to_string(),
                 next_hop: Some("2001:db8::1".to_string()),
+                dev_attr255_interval_secs: None,
             },
         ],
         archive: ArchiveConfig {
@@ -170,8 +174,12 @@ async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()
     Ok(())
 }
 
-/// Builds a service with one passive peer and no configured prefixes.
-async fn service_with_passive_peer(temp: &tempfile::TempDir, port: u16) -> Result<BgpService> {
+/// Builds a service with one passive peer and the given configured prefixes.
+async fn service_with_prefixes(
+    temp: &tempfile::TempDir,
+    port: u16,
+    prefixes: Vec<PrefixConfig>,
+) -> Result<BgpService> {
     let cfg = FoclConfig {
         global: GlobalConfig {
             asn: FOCL_AS,
@@ -195,7 +203,7 @@ async fn service_with_passive_peer(temp: &tempfile::TempDir, port: u16) -> Resul
             name: None,
             password: None,
         }],
-        prefixes: vec![],
+        prefixes,
         archive: ArchiveConfig {
             enabled: false,
             ..ArchiveConfig::default()
@@ -203,6 +211,26 @@ async fn service_with_passive_peer(temp: &tempfile::TempDir, port: u16) -> Resul
     };
     let (event_tx, _events) = broadcast::channel(16);
     BgpService::new(&cfg, event_tx).await
+}
+
+/// Builds a service with one passive peer and no configured prefixes.
+async fn service_with_passive_peer(temp: &tempfile::TempDir, port: u16) -> Result<BgpService> {
+    service_with_prefixes(temp, port, vec![]).await
+}
+
+/// Builds a service with one passive peer and the clock prefix configured to
+/// re-announce every second.
+async fn service_with_clock_prefix(temp: &tempfile::TempDir, port: u16) -> Result<BgpService> {
+    service_with_prefixes(
+        temp,
+        port,
+        vec![PrefixConfig {
+            network: CLOCK_PREFIX.to_string(),
+            next_hop: Some("2001:db8::1".to_string()),
+            dev_attr255_interval_secs: Some(1),
+        }],
+    )
+    .await
 }
 
 /// Connects as the peer side and completes the OPEN/KEEPALIVE exchange.
@@ -308,6 +336,126 @@ async fn runtime_changes_skip_peers_without_the_family() -> Result<()> {
     Ok(())
 }
 
+/// The attribute-255 clock travels on the wire for a configured prefix and is
+/// re-announced with a fresh embedded unix time on the configured interval.
+#[tokio::test]
+async fn clock_attribute_refreshes_on_schedule() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let _bgp = service_with_clock_prefix(&temp, port).await?;
+    let mut stream = establish_peer_session(port, capabilities()).await?;
+
+    let (flags, first_payload) =
+        timeout(Duration::from_secs(5), read_development_clock(&mut stream)).await??;
+    assert_eq!(first_payload.len(), 13, "13-byte clock payload");
+    assert!(
+        first_payload.starts_with(b"BGPKIT\x01"),
+        "magic and version lead the payload"
+    );
+    assert!(
+        flags.contains(AttrFlags::OPTIONAL) && flags.contains(AttrFlags::TRANSITIVE),
+        "originating flags must be OPTIONAL|TRANSITIVE, got {flags:?}"
+    );
+    assert!(
+        !flags.contains(AttrFlags::PARTIAL),
+        "an originated attribute must not be marked PARTIAL"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_secs();
+    let first_unix = clock_unix(&first_payload);
+    assert!(
+        first_unix.abs_diff(now) <= 60,
+        "embedded unix {first_unix} must be within a minute of now ({now})"
+    );
+
+    // The refresh loop re-sends the announcement with a newer clock while the
+    // session stays up.
+    let later_unix = timeout(Duration::from_secs(5), async {
+        loop {
+            let message = read_message(&mut stream).await?;
+            if let Some((_, payload)) = development_clock(&message, CLOCK_PREFIX) {
+                let unix = clock_unix(&payload);
+                if unix > first_unix {
+                    return Ok::<_, anyhow::Error>(unix);
+                }
+            }
+        }
+    })
+    .await??;
+    assert!(later_unix > first_unix);
+    Ok(())
+}
+
+/// Removing and re-adding a configured clock prefix keeps the attribute-255
+/// clock on the announcement the re-add emits.
+#[tokio::test]
+async fn runtime_readd_keeps_configured_clock() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let bgp = service_with_clock_prefix(&temp, port).await?;
+    let mut stream = establish_peer_session(port, capabilities()).await?;
+    let network: IpNet = CLOCK_PREFIX.parse()?;
+
+    // Wait for the establishment announcement, then for a refresh tick. A
+    // tick only reaches the socket through a registered session handle, so
+    // the removal below cannot race the session's initial table send (an
+    // early removal would simply never announce, and withdraw nothing).
+    let (_, first_payload) =
+        timeout(Duration::from_secs(5), read_development_clock(&mut stream)).await??;
+    let first_unix = clock_unix(&first_payload);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let message = read_message(&mut stream).await?;
+            if let Some((_, payload)) = development_clock(&message, CLOCK_PREFIX) {
+                if clock_unix(&payload) > first_unix {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        }
+    })
+    .await
+    .context("the refresh tick did not arrive before the removal")??;
+
+    let removed = bgp.prefix_remove(network, false).await?;
+    assert!(removed.changed);
+    timeout(
+        Duration::from_secs(5),
+        read_until_withdrawal(&mut stream, CLOCK_PREFIX),
+    )
+    .await
+    .context("withdrawal for the removed clock prefix did not arrive")??;
+
+    // Removal silences the refresh loop. Drain anything that was already in
+    // flight, so the next announcement observed is the one re-add emits.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match timeout(Duration::from_millis(1500), read_message(&mut stream)).await {
+                Err(_) => return Ok::<_, anyhow::Error>(()),
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => return Err(error),
+            }
+        }
+    })
+    .await
+    .context("the clock prefix did not go quiet after removal")??;
+
+    let added = bgp.prefix_add(network, None, false).await?;
+    assert!(added.changed);
+    assert_eq!(added.peers_notified, vec!["127.0.0.1".to_string()]);
+    let (flags, payload) = timeout(Duration::from_secs(5), read_development_clock(&mut stream))
+        .await
+        .context("the re-add announcement did not arrive")??;
+    assert_eq!(payload.len(), 13);
+    assert!(payload.starts_with(b"BGPKIT\x01"));
+    assert!(
+        flags.contains(AttrFlags::OPTIONAL) && flags.contains(AttrFlags::TRANSITIVE),
+        "the re-added prefix keeps the clock with originating flags"
+    );
+    Ok(())
+}
+
 fn capabilities() -> Vec<u8> {
     let mut bytes = vec![1, 4, 0, 1, 0, 1, 1, 4, 0, 2, 0, 1, 65, 4];
     bytes.extend_from_slice(&PEER_AS.to_be_bytes());
@@ -383,6 +531,78 @@ fn has_focl_v4(message: &BgpMessage) -> bool {
 
 fn has_focl_v6(message: &BgpMessage) -> bool {
     matches!(message, BgpMessage::Update(update) if update.attributes.get_reachable_nlri().is_some_and(|nlri| nlri.prefixes.iter().any(|prefix| prefix.prefix.to_string() == "2001:db8:feed::/48")))
+}
+
+/// The attribute-255 payload attached to an announcement of `prefix`, when
+/// present, together with its attribute flags.
+fn development_clock(message: &BgpMessage, prefix: &str) -> Option<(AttrFlags, Vec<u8>)> {
+    let BgpMessage::Update(update) = message else {
+        return None;
+    };
+    let announced = update
+        .announced_prefixes
+        .iter()
+        .any(|network| network.prefix.to_string() == prefix)
+        || update
+            .attributes
+            .get_reachable_nlri()
+            .is_some_and(|nlri| nlri.prefixes.iter().any(|p| p.prefix.to_string() == prefix));
+    if !announced {
+        return None;
+    }
+    update
+        .attributes
+        .clone()
+        .into_attributes_iter()
+        .find_map(|attribute| match attribute.value {
+            AttributeValue::Development(payload) => Some((attribute.flag, payload)),
+            _ => None,
+        })
+}
+
+/// True when the message withdraws `prefix` (classic NLRI or MP_UNREACH).
+fn withdraws_prefix(message: &BgpMessage, prefix: &str) -> bool {
+    let BgpMessage::Update(update) = message else {
+        return false;
+    };
+    update
+        .withdrawn_prefixes
+        .iter()
+        .any(|network| network.prefix.to_string() == prefix)
+        || update
+            .attributes
+            .get_unreachable_nlri()
+            .is_some_and(|nlri| nlri.prefixes.iter().any(|p| p.prefix.to_string() == prefix))
+}
+
+/// The low 32 bits of the send time embedded in a clock payload.
+fn clock_unix(payload: &[u8]) -> u64 {
+    u64::from(u32::from_be_bytes([
+        payload[9],
+        payload[10],
+        payload[11],
+        payload[12],
+    ]))
+}
+
+/// Reads until the clock prefix is announced with the development attribute.
+async fn read_development_clock(stream: &mut TcpStream) -> Result<(AttrFlags, Vec<u8>)> {
+    loop {
+        let message = read_message(stream).await?;
+        if let Some(clock) = development_clock(&message, CLOCK_PREFIX) {
+            return Ok(clock);
+        }
+    }
+}
+
+/// Reads until `prefix` is withdrawn.
+async fn read_until_withdrawal(stream: &mut TcpStream, prefix: &str) -> Result<()> {
+    loop {
+        let message = read_message(stream).await?;
+        if withdraws_prefix(&message, prefix) {
+            return Ok(());
+        }
+    }
 }
 
 async fn write_message(stream: &mut TcpStream, message: &BgpMessage) -> Result<()> {
