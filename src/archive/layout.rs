@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Result};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
@@ -110,6 +110,7 @@ fn build_custom_relative_path(
     minute: u32,
     ext: &str,
 ) -> Result<PathBuf> {
+    crate::config::validate_relative_template(template)?;
     if !template.contains("{collector}")
         || !template.contains("{yyyymmdd}")
         || !template.contains("{hhmm}")
@@ -140,6 +141,17 @@ fn build_custom_relative_path(
             .ok_or_else(|| anyhow::anyhow!("custom template did not produce file name"))?
             .to_string_lossy();
         path.set_file_name(format!("{}.{}", file_name, ext));
+    }
+
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("custom template rendered an unsafe path");
     }
 
     Ok(path)

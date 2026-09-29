@@ -67,6 +67,12 @@ impl FoclConfig {
             prefix.network.parse::<IpNet>().with_context(|| {
                 format!("invalid IP prefix in [[prefixes]]: {}", prefix.network)
             })?;
+            if prefix.dev_attr255_interval_secs == Some(0) {
+                bail!(
+                    "[[prefixes]] {} has invalid dev_attr255_interval_secs; must be > 0",
+                    prefix.network
+                );
+            }
         }
 
         self.archive.validate()?;
@@ -152,6 +158,11 @@ pub struct PrefixConfig {
     pub network: String,
     #[serde(default)]
     pub next_hop: Option<String>,
+    /// Attaches attribute 255 (reserved for development, RFC 2042) to this
+    /// prefix's announcements, carrying a BGPKIT clock payload, re-announced
+    /// every N seconds. Absent = no attribute.
+    #[serde(default)]
+    pub dev_attr255_interval_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,12 +232,17 @@ impl Default for ArchiveConfig {
 
 impl ArchiveConfig {
     pub fn validate(&self) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
+        validate_collector_id(&self.collector_id)?;
+        if self.layout_profile == LayoutProfile::Custom {
+            let templates = self
+                .custom_templates
+                .as_ref()
+                .context("[archive].layout_profile=custom requires [archive.custom_templates]")?;
+            templates.validate()?;
         }
 
-        if self.collector_id.trim().is_empty() {
-            bail!("[archive].collector_id must not be empty");
+        if !self.enabled {
+            return Ok(());
         }
 
         if self.updates_interval_secs == 0 || 3600 % self.updates_interval_secs != 0 {
@@ -258,14 +274,6 @@ impl ArchiveConfig {
 
         if primary_count == 0 {
             bail!("[archive].destinations must include at least one mode=primary destination");
-        }
-
-        if self.layout_profile == LayoutProfile::Custom {
-            let templates = self
-                .custom_templates
-                .as_ref()
-                .context("[archive].layout_profile=custom requires [archive.custom_templates]")?;
-            templates.validate()?;
         }
 
         for destination in &self.destinations {
@@ -316,6 +324,9 @@ pub struct CustomLayoutTemplates {
 impl CustomLayoutTemplates {
     pub fn validate(&self) -> Result<()> {
         for (name, value) in [("updates", &self.updates), ("ribs", &self.ribs)] {
+            validate_relative_template(value).with_context(|| {
+                format!("[archive.custom_templates].{name} must be a safe relative path")
+            })?;
             if !value.contains("{collector}") {
                 bail!(
                     "[archive.custom_templates].{} must contain {{collector}} token",
@@ -331,6 +342,40 @@ impl CustomLayoutTemplates {
         }
         Ok(())
     }
+}
+
+fn validate_collector_id(collector_id: &str) -> Result<()> {
+    let bytes = collector_id.as_bytes();
+    let valid = (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !valid {
+        bail!("[archive].collector_id must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_relative_template(template: &str) -> Result<()> {
+    let bytes = template.as_bytes();
+    let has_drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if template.starts_with('/') || template.starts_with('\\') || has_drive_prefix {
+        bail!("template must not be absolute");
+    }
+    if template.contains('\\') {
+        bail!("template must not contain backslashes");
+    }
+    if template.chars().any(char::is_control) {
+        bail!("template must not contain control characters");
+    }
+    if template.split('/').any(|component| component.is_empty()) {
+        bail!("template must not contain empty path components");
+    }
+    if template.split('/').any(|component| component == "..") {
+        bail!("template must not contain parent path components");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -501,5 +546,88 @@ layout_profile = "routeviews"
 
         let cfg: FoclConfig = toml::from_str(raw).expect("toml should parse");
         assert_eq!(cfg.archive.layout_profile, LayoutProfile::RouteViews);
+    }
+
+    #[test]
+    fn prefix_config_roundtrips_dev_attr255_interval() {
+        let raw = r#"
+[global]
+asn = 65001
+router_id = "192.0.2.1"
+
+[[prefixes]]
+network = "2001:db8::/48"
+dev_attr255_interval_secs = 1800
+
+[[prefixes]]
+network = "192.0.2.0/24"
+"#;
+        let cfg: FoclConfig = toml::from_str(raw).expect("toml should parse");
+        assert_eq!(cfg.prefixes[0].dev_attr255_interval_secs, Some(1800));
+        assert_eq!(cfg.prefixes[1].dev_attr255_interval_secs, None);
+
+        let encoded = toml::to_string(&cfg).expect("config should serialize");
+        let reparsed: FoclConfig = toml::from_str(&encoded).expect("roundtrip should parse");
+        assert_eq!(reparsed.prefixes[0].dev_attr255_interval_secs, Some(1800));
+        assert_eq!(reparsed.prefixes[1].dev_attr255_interval_secs, None);
+    }
+
+    #[test]
+    fn rejects_zero_dev_attr255_interval() {
+        let raw = r#"
+[global]
+asn = 65001
+router_id = "192.0.2.1"
+
+[[prefixes]]
+network = "192.0.2.0/24"
+dev_attr255_interval_secs = 0
+"#;
+        let cfg: FoclConfig = toml::from_str(raw).expect("toml should parse");
+        let error = cfg
+            .validate()
+            .expect_err("a zero refresh interval must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("dev_attr255_interval_secs; must be > 0"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_absolute_custom_template() {
+        let templates = CustomLayoutTemplates {
+            updates: "/{collector}/updates.{yyyymmdd}.{hhmm}.{ext}".to_string(),
+            ribs: "{collector}/ribs.{yyyymmdd}.{hhmm}.{ext}".to_string(),
+        };
+        assert!(templates.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_parent_traversal_in_custom_template() {
+        let templates = CustomLayoutTemplates {
+            updates: "{collector}/../updates.{yyyymmdd}.{hhmm}.{ext}".to_string(),
+            ribs: "{collector}/ribs.{yyyymmdd}.{hhmm}.{ext}".to_string(),
+        };
+        assert!(templates.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_collector_id_with_slash() {
+        let cfg = ArchiveConfig {
+            collector_id: "focl/01".to_string(),
+            ..ArchiveConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn valid_custom_template_still_passes() {
+        let templates = CustomLayoutTemplates {
+            updates: "{collector}/{yyyy}/updates.{yyyymmdd}.{hhmm}.{ext}".to_string(),
+            ribs: "{collector}/{yyyy}/ribs.{yyyymmdd}.{hhmm}.{ext}".to_string(),
+        };
+        templates.validate().expect("safe template should validate");
     }
 }
