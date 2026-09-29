@@ -127,22 +127,18 @@ MRT; the archive knows nothing about BMP/BGP sessions.
    mutation, connection-collision handling, and separate v4/v6 bind
    configuration; replacing per-peer binds; the `listen` global config
    becomes real.
-6. **Reference interop target: duck (announcer replacement).** The
-   production reference is `duck`, the Vultr BGP announcer. Note duck runs
-   **BIRD** (not FRR) today; `/etc/bird/bird.conf` is the reference config:
-   - AS 400644, router id 149.28.81.209
-   - two Vultr sessions: v4 peer 169.254.169.254 and v6 peer
-     2001:19f0:ffff::1, both remote AS 64515, both with TCP-MD5 password
-   - announces 192.100.82.0/24 (next hop 149.28.81.209) and
-     2620:aa:a000::/48 (next hop 2001:19f0:6001:30cc:5400:5ff:fe61:25da)
-     with blackhole backing; `import none; export filter` policy
-   Phase 1 done means: focl replaces bird on duck for these two
-   announcements — active sessions to the Vultr peers with MD5, correct
-   MP-BGP capability negotiation (v4 session advertises v4; v6 session
-   negotiates MP-BGP v6 and announces via MP_REACH), routes present in
-   Vultr's looking glass, and MRT updates archived for both families.
-   Deployment is a separate manual step (routing-infrastructure change,
-   operator-driven).
+6. **Reference interop target: replacing a running announcer.** The
+   production reference is a single-host announcer running **BIRD** (not
+   FRR), with one session per address family, both authenticated with
+   TCP-MD5, each announcing one block with blackhole backing under a
+   restrictive export policy (`import none`).
+   Phase 1 done means: focl replaces BIRD on that host for both
+   announcements — active MD5 sessions to the upstream peers, correct
+   MP-BGP capability negotiation (the v4 session advertises v4; the v6
+   session negotiates MP-BGP v6 and announces via MP_REACH), the prefixes
+   visible in the upstream provider's looking glass, and MRT updates
+   archived for both families. Deployment is a separate manual step
+   (routing-infrastructure change, operator-driven).
 7. **Interop expansion.** Extend the GoBGP scripts: v6 session, capability
    matrix, flap → assert MRT files parse and contain expected elements.
    Negative tests (review minor 16): malformed UPDATE disposition, Peer
