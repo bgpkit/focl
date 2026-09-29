@@ -1,30 +1,32 @@
 use std::io::{Cursor, Read};
-use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bgpkit_parser::bgp::parse_bgp_message;
 use bgpkit_parser::models::{
-    AsPath, Asn, AsnLength, AttrFlags, AttributeValue, Attributes, BgpMessage, BgpOpenMessage,
-    BgpUpdateMessage, NetworkPrefix, Nlri, OptParam, Origin, ParamValue,
+    Afi, AsPath, Asn, AsnLength, AttrFlags, AttributeValue, Attributes, BgpMessage, BgpOpenMessage,
+    BgpRouteRefreshMessage, BgpUpdateMessage, NetworkPrefix, Nlri, OptParam, Origin, ParamValue,
 };
 use bgpkit_parser::parse_mrt_record;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use focl::archive::types::ArchiveStream;
 use focl::archive::ArchiveService;
-use focl::bgp::{BgpService, PrefixSource, PrefixStatus};
+use focl::bgp::{BgpService, PrefixSource, PrefixStatus, TcpSocketExt};
 use focl::config::{ArchiveConfig, FoclConfig, GlobalConfig, PeerConfig, PrefixConfig};
 use focl::types::{Event, PeerState};
 use ipnet::IpNet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
 const PEER_AS: u32 = 65_002;
 const FOCL_AS: u32 = 65_001;
+/// The TCP-MD5 password of the passive peer in the MD5 acceptance test.
+const MD5_PASSWORD: &str = "focl-md5-acceptance";
 /// The IPv6 prefix carrying the attribute-255 clock in the clock tests.
 const CLOCK_PREFIX: &str = "2001:db8:feed::/48";
 
@@ -166,7 +168,8 @@ async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()
         parse_mrt_record(&mut cursor)?;
         record_count += 1;
     }
-    // two outbound configured-prefix UPDATEs plus the two peer UPDATEs, and state changes.
+    // one outbound UPDATE per configured prefix plus the two peer UPDATEs, and
+    // state changes.
     assert!(
         record_count >= 4,
         "expected both directions in archived BGP4MP records"
@@ -179,6 +182,18 @@ async fn service_with_prefixes(
     temp: &tempfile::TempDir,
     port: u16,
     prefixes: Vec<PrefixConfig>,
+) -> Result<BgpService> {
+    service_with_peer(temp, port, prefixes, None, 30).await
+}
+
+/// Same as [`service_with_prefixes`], with an optional TCP-MD5 password and an
+/// explicit hold time on the passive peer.
+async fn service_with_peer(
+    temp: &tempfile::TempDir,
+    port: u16,
+    prefixes: Vec<PrefixConfig>,
+    password: Option<&str>,
+    hold_time_secs: u16,
 ) -> Result<BgpService> {
     let cfg = FoclConfig {
         global: GlobalConfig {
@@ -193,7 +208,7 @@ async fn service_with_prefixes(
             address: "127.0.0.1".to_string(),
             remote_as: PEER_AS,
             local_as: None,
-            hold_time_secs: 30,
+            hold_time_secs,
             connect_retry_secs: 1,
             remote_port: port,
             local_address: None,
@@ -201,7 +216,7 @@ async fn service_with_prefixes(
             passive: true,
             route_refresh: true,
             name: None,
-            password: None,
+            password: password.map(str::to_string),
         }],
         prefixes,
         archive: ArchiveConfig {
@@ -235,6 +250,18 @@ async fn service_with_clock_prefix(temp: &tempfile::TempDir, port: u16) -> Resul
 
 /// Connects as the peer side and completes the OPEN/KEEPALIVE exchange.
 async fn establish_peer_session(port: u16, capabilities: Vec<u8>) -> Result<TcpStream> {
+    establish_session(port, peer_open_with_capabilities(capabilities)).await
+}
+
+/// Connects as a peer that negotiates no capabilities at all: a plain RFC 4271
+/// IPv4-only speaker, whose OPEN carries no optional parameters.
+async fn establish_capability_less_session(port: u16) -> Result<TcpStream> {
+    establish_session(port, peer_open_without_capabilities()).await
+}
+
+/// Connects as the peer side with `open` and completes the OPEN/KEEPALIVE
+/// exchange.
+async fn establish_session(port: u16, open: BgpMessage) -> Result<TcpStream> {
     let mut stream = timeout(
         Duration::from_secs(5),
         TcpStream::connect(("127.0.0.1", port)),
@@ -244,7 +271,7 @@ async fn establish_peer_session(port: u16, capabilities: Vec<u8>) -> Result<TcpS
         read_message(&mut stream).await?,
         BgpMessage::Open(_)
     ));
-    write_message(&mut stream, &peer_open_with_capabilities(capabilities)).await?;
+    write_message(&mut stream, &open).await?;
     assert!(matches!(
         read_message(&mut stream).await?,
         BgpMessage::KeepAlive
@@ -332,6 +359,225 @@ async fn runtime_changes_skip_peers_without_the_family() -> Result<()> {
             .await
             .is_err(),
         "an IPv6 update must not reach a v4-only peer"
+    );
+    Ok(())
+}
+
+/// TCP-MD5 (RFC 2385) on a passive session: the kernel validates the digest on
+/// the SYN, before `accept()` can return, so the key has to be installed on the
+/// listening socket. Without that install a peer with a configured password can
+/// never complete the handshake (its connect hangs, the session never starts).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn passive_session_with_md5_completes_the_handshake() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let bgp = service_with_peer(
+        &temp,
+        port,
+        vec![PrefixConfig {
+            network: "198.51.100.0/24".to_string(),
+            next_hop: Some("192.0.2.1".to_string()),
+            dev_attr255_interval_secs: None,
+        }],
+        Some(MD5_PASSWORD),
+        30,
+    )
+    .await?;
+
+    // The peer side installs the same key on its own socket before connecting,
+    // exactly like an authenticating router would. Installing a TCP-MD5 key
+    // needs CAP_NET_ADMIN, like it does for the daemon.
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+    let socket = TcpSocket::new_v4()?;
+    socket
+        .set_md5_signature(&remote, MD5_PASSWORD)
+        .context("installing the peer-side TCP-MD5 key (needs CAP_NET_ADMIN)")?;
+    let mut stream = timeout(Duration::from_secs(5), socket.connect(remote))
+        .await
+        .context("the MD5-keyed peer could not connect: the listener has no key")??;
+
+    assert!(matches!(
+        read_message(&mut stream).await?,
+        BgpMessage::Open(_)
+    ));
+    write_message(&mut stream, &peer_open()).await?;
+    assert!(matches!(
+        read_message(&mut stream).await?,
+        BgpMessage::KeepAlive
+    ));
+    write_message(&mut stream, &BgpMessage::KeepAlive).await?;
+
+    // The authenticated session exchanges routes like any other.
+    let announcement = read_message(&mut stream).await?;
+    assert!(
+        has_focl_v4(&announcement),
+        "expected the configured table over the MD5 session, got {announcement:?}"
+    );
+    assert!(ipv4_eor(&read_message(&mut stream).await?));
+    let peer = bgp
+        .peer_show("127.0.0.1")
+        .await
+        .context("peer stays configured")?;
+    assert!(matches!(peer.state, PeerState::Established));
+    Ok(())
+}
+
+/// RFC 2918 s4: a ROUTE-REFRESH for a negotiated family replays that family's
+/// Adj-RIB-Out and then its End-of-RIB. A refresh for the other family stays
+/// silent (see `route_refresh_for_an_unnegotiated_family_is_ignored`).
+#[tokio::test]
+async fn route_refresh_replays_the_requested_family_then_end_of_rib() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let bgp = service_with_prefixes(
+        &temp,
+        port,
+        vec![
+            PrefixConfig {
+                network: "198.51.100.0/24".to_string(),
+                next_hop: Some("192.0.2.1".to_string()),
+                dev_attr255_interval_secs: None,
+            },
+            PrefixConfig {
+                network: "2001:db8:feed::/48".to_string(),
+                next_hop: Some("2001:db8::1".to_string()),
+                dev_attr255_interval_secs: None,
+            },
+        ],
+    )
+    .await?;
+    let mut stream = establish_peer_session(port, capabilities()).await?;
+
+    // Establishment sends the configured table once per family, then both
+    // End-of-RIB markers.
+    let mut v4_seen = false;
+    let mut v6_seen = false;
+    let mut v4_eor_seen = false;
+    let mut v6_eor_seen = false;
+    timeout(Duration::from_secs(5), async {
+        while !(v4_eor_seen && v6_eor_seen) {
+            let message = read_message(&mut stream).await?;
+            v4_seen |= has_focl_v4(&message);
+            v6_seen |= has_focl_v6(&message);
+            v4_eor_seen |= ipv4_eor(&message);
+            v6_eor_seen |= ipv6_eor(&message);
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    assert!(
+        v4_seen && v6_seen,
+        "expected both families in the initial table"
+    );
+
+    // Ask for the IPv4 table again: the replay carries the IPv4 prefix, not the
+    // IPv6 one, and ends with the IPv4 End-of-RIB.
+    write_message(&mut stream, &route_refresh(1, 1)).await?;
+    let replay = read_message(&mut stream).await?;
+    assert!(
+        has_focl_v4(&replay),
+        "expected the IPv4 announcement to be replayed, got {replay:?}"
+    );
+    assert!(
+        !has_focl_v6(&replay),
+        "an IPv4 refresh must not replay the IPv6 table: {replay:?}"
+    );
+    let trailing_eor = read_message(&mut stream).await?;
+    assert!(
+        ipv4_eor(&trailing_eor),
+        "the replay has to end with the IPv4 End-of-RIB, got {trailing_eor:?}"
+    );
+
+    let peer = bgp
+        .peer_show("127.0.0.1")
+        .await
+        .context("the session survives the replay")?;
+    assert!(matches!(peer.state, PeerState::Established));
+    Ok(())
+}
+
+/// A refresh for a family the session did not negotiate has no Adj-RIB-Out to
+/// send and must leave the session silent (RFC 2918 s4).
+#[tokio::test]
+async fn route_refresh_for_an_unnegotiated_family_is_ignored() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let _bgp = service_with_passive_peer(&temp, port).await?;
+    let mut stream = establish_peer_session(port, capabilities_v4_only()).await?;
+    // A v4-only peer with no configured prefixes gets the IPv4 EoR only.
+    assert!(ipv4_eor(&read_message(&mut stream).await?));
+
+    write_message(&mut stream, &route_refresh(2, 1)).await?;
+    assert!(
+        timeout(Duration::from_millis(250), read_message(&mut stream))
+            .await
+            .is_err(),
+        "an IPv6 refresh on a v4-only session must be ignored"
+    );
+    Ok(())
+}
+
+/// RFC 4271: a peer that negotiates no capabilities still has classic IPv4
+/// unicast, so it gets the IPv4 table and the IPv4 End-of-RIB, and only once.
+#[tokio::test]
+async fn capability_less_peer_receives_the_ipv4_table_and_end_of_rib_once() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let _bgp = service_with_prefixes(
+        &temp,
+        port,
+        vec![PrefixConfig {
+            network: "198.51.100.0/24".to_string(),
+            next_hop: Some("192.0.2.1".to_string()),
+            dev_attr255_interval_secs: None,
+        }],
+    )
+    .await?;
+    let mut stream = establish_capability_less_session(port).await?;
+
+    let announcement = read_message(&mut stream).await?;
+    assert!(
+        has_focl_v4(&announcement),
+        "classic NLRI is available without any capability, got {announcement:?}"
+    );
+    let eor = read_message(&mut stream).await?;
+    assert!(
+        ipv4_eor(&eor),
+        "the IPv4 End-of-RIB must follow the table, got {eor:?}"
+    );
+
+    // The initial table is sent exactly once, under the registration lock: no
+    // duplicate announcement after the End-of-RIB, and nothing for a family
+    // that was not negotiated.
+    assert!(
+        timeout(Duration::from_millis(250), read_message(&mut stream))
+            .await
+            .is_err(),
+        "a capability-less session must be quiet after its single table and EoR"
+    );
+    Ok(())
+}
+
+/// RFC 4271 s4.2/s4.4: the OPEN advertises the configured hold time — including
+/// 0, which disables the timers instead of being raised to a minimum.
+#[tokio::test]
+async fn open_advertises_the_configured_hold_time_including_zero() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let _bgp = service_with_peer(&temp, port, vec![], None, 0).await?;
+
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await??;
+    let BgpMessage::Open(open) = read_message(&mut stream).await? else {
+        panic!("the first message from focld must be an OPEN")
+    };
+    assert_eq!(
+        open.hold_time, 0,
+        "a configured hold time of 0 means \"no timers\" and must be advertised as-is"
     );
     Ok(())
 }
@@ -489,6 +735,44 @@ fn peer_open() -> BgpMessage {
     peer_open_with_capabilities(capabilities())
 }
 
+/// An OPEN without any optional parameter: a peer that negotiates nothing.
+fn peer_open_without_capabilities() -> BgpMessage {
+    BgpMessage::Open(BgpOpenMessage {
+        version: 4,
+        asn: Asn::new_16bit(PEER_AS as u16),
+        hold_time: 30,
+        bgp_identifier: Ipv4Addr::new(192, 0, 2, 2),
+        extended_length: false,
+        opt_params: vec![],
+    })
+}
+
+/// A ROUTE-REFRESH (RFC 2918) for one family. AFI and SAFI are the raw wire
+/// integers, so the tests can also ask for a family they did not negotiate.
+fn route_refresh(afi: u16, safi: u8) -> BgpMessage {
+    BgpMessage::RouteRefresh(BgpRouteRefreshMessage {
+        afi,
+        subtype: 0,
+        safi,
+        data: vec![],
+    })
+}
+
+/// The IPv4 End-of-RIB: an UPDATE with no NLRI and no attributes (RFC 4271).
+fn ipv4_eor(message: &BgpMessage) -> bool {
+    matches!(message, BgpMessage::Update(update)
+        if update.withdrawn_prefixes.is_empty()
+            && update.announced_prefixes.is_empty()
+            && update.attributes.clone().into_attributes_iter().next().is_none())
+}
+
+/// The IPv6 End-of-RIB: MP_UNREACH_NLRI for IPv6 with no prefix.
+fn ipv6_eor(message: &BgpMessage) -> bool {
+    matches!(message, BgpMessage::Update(update)
+        if update.announced_prefixes.is_empty()
+            && update.attributes.get_unreachable_nlri().is_some_and(|nlri| nlri.afi == Afi::Ipv6 && nlri.prefixes.is_empty()))
+}
+
 fn attrs() -> Attributes {
     let mut attrs = Attributes::default();
     attrs.add_attr(AttributeValue::Origin(Origin::IGP).into());
@@ -622,8 +906,13 @@ async fn read_message(stream: &mut TcpStream) -> Result<BgpMessage> {
         timeout(Duration::from_secs(5), stream.read_exact(&mut body)).await??;
         raw.extend_from_slice(&body);
     }
-    let mut bytes = Bytes::from(raw);
-    Ok(parse_bgp_message(&mut bytes, false, &AsnLength::Bits32)?)
+    // A session without the four-octet AS capability encodes its AS_PATH with
+    // 2-octet segments, so fall back to that width like focld's own reader.
+    let mut wide = Bytes::from(raw.clone());
+    let mut narrow = Bytes::from(raw);
+    parse_bgp_message(&mut wide, false, &AsnLength::Bits32)
+        .or_else(|_| parse_bgp_message(&mut narrow, false, &AsnLength::Bits16))
+        .map_err(Into::into)
 }
 
 #[test]

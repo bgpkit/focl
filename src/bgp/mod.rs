@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::unix::io::AsRawFd;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use bgpkit_parser::bgp::parse_bgp_message;
 use bgpkit_parser::models::{
     Afi, AsPath, Asn, AsnLength, AttrFlags, Attribute, AttributeValue, Attributes, BgpMessage,
-    BgpOpenMessage, BgpUpdateMessage, NetworkPrefix, Nlri, OptParam, Origin, ParamValue, Safi,
+    BgpOpenMessage, BgpRouteRefreshMessage, BgpUpdateMessage, NetworkPrefix, Nlri, OptParam,
+    Origin, ParamValue, Safi,
 };
 use bytes::Bytes;
 use ipnet::IpNet;
@@ -26,7 +28,10 @@ use crate::config::{FoclConfig, PeerConfig};
 use crate::types::{Event, EventEnvelope, PeerState};
 
 mod auth;
-use auth::{TcpSocketExt, TcpStreamExt};
+/// TCP-MD5 socket helpers (RFC 2385). Re-exported so library users and the
+/// socket-level tests can authenticate a session against `focld` the same way
+/// the daemon does.
+pub use auth::{TcpSocketExt, TcpStreamExt};
 
 const AS_TRANS: u16 = 23_456;
 
@@ -405,6 +410,22 @@ impl NegotiatedCapabilities {
     fn plain_ipv4(&self) -> bool {
         self.families.is_empty()
     }
+
+    /// Whether the session carries the family for announcements and for
+    /// End-of-RIB: a capability-less peer still has classic IPv4 (RFC 4271),
+    /// so every IPv4 decision has to accept [`Self::plain_ipv4`] as well.
+    fn carries(&self, afi: Afi, safi: Safi) -> bool {
+        self.supports(afi, safi) || (afi == Afi::Ipv4 && safi == Safi::Unicast && self.plain_ipv4())
+    }
+
+    /// AS number width on this session's wire (RFC 6793).
+    fn asn_length(&self) -> AsnLength {
+        if self.asn4 {
+            AsnLength::Bits32
+        } else {
+            AsnLength::Bits16
+        }
+    }
 }
 
 struct BgpServiceInner {
@@ -469,7 +490,9 @@ impl BgpService {
         let service = Self { inner };
         service.start_peers(&cfg.peers).await;
         if cfg.global.listen {
-            service.start_listener(&cfg.global.listen_addr).await?;
+            service
+                .start_listener(&cfg.global.listen_addr, &cfg.peers)
+                .await?;
         }
         service.start_clock_refresh().await;
         Ok(service)
@@ -519,10 +542,15 @@ impl BgpService {
         tokio::spawn(async move { service.peer_loop(peer_cfg).await })
     }
 
-    async fn start_listener(&self, listen_addr: &str) -> Result<()> {
+    async fn start_listener(&self, listen_addr: &str, peers: &[PeerConfig]) -> Result<()> {
         let listener = TcpListener::bind(listen_addr)
             .await
             .with_context(|| format!("failed binding global BGP listener {listen_addr}"))?;
+        // RFC 2385: the kernel validates the MD5 digest when the SYN arrives,
+        // so a passive peer's key has to live on the listening socket before
+        // `accept()` can ever return for that peer. The accepted-connection
+        // install in `accept_inbound` stays as the per-connection assertion.
+        install_listener_md5_keys(listener.as_raw_fd(), &listener_md5_keys(peers));
         let service = self.clone();
         tokio::spawn(async move {
             loop {
@@ -726,11 +754,13 @@ impl BgpService {
             .await;
 
         let local_as = peer.local_as.unwrap_or(self.inner.global_asn);
-        let hold_time = peer.hold_time_secs.max(3);
+        // RFC 4271 s4.2: the OPEN carries the configured hold time as-is; 0 is
+        // a deliberate "timers disabled" setting and must not be raised to a
+        // minimum here.
         let open = local_open(
             self.inner.router_id,
             local_as,
-            hold_time,
+            peer.hold_time_secs,
             peer.route_refresh,
         );
         write_bgp_message(&mut writer, &open, AsnLength::Bits32).await?;
@@ -741,6 +771,9 @@ impl BgpService {
         };
         let negotiated = negotiate_capabilities(&incoming.raw, peer.route_refresh);
         validate_remote_as(&remote_open, &incoming.raw, peer.remote_as, negotiated.asn4)?;
+        // RFC 4271 s4.4/s6.1: the hold time that governs this session is 0 when
+        // either side advertised 0, otherwise the smaller of the two.
+        let hold_time = negotiate_hold_time(peer.hold_time_secs, remote_open.hold_time);
 
         self.set_peer_state(&peer.address, PeerState::OpenConfirm, None, None)
             .await;
@@ -757,55 +790,19 @@ impl BgpService {
             Some(chrono::Utc::now().timestamp()),
         )
         .await;
-        self.send_prefix_announcements(peer, &mut writer, &negotiated, local_ip)
-            .await?;
-        // RFC 4271 End-of-RIB: an empty UPDATE per family marks the initial
-        // table transfer complete. Vultr's route servers treat a session
-        // missing EoR as still converging; send both families' markers.
-        for eor_family in [Afi::Ipv4, Afi::Ipv6] {
-            if negotiated.supports(eor_family, Safi::Unicast) {
-                let eor = if eor_family == Afi::Ipv4 {
-                    BgpMessage::Update(BgpUpdateMessage::default())
-                } else {
-                    let mut attrs = Attributes::default();
-                    attrs.add_attr(
-                        AttributeValue::MpUnreachNlri(Nlri {
-                            afi: Afi::Ipv6,
-                            safi: Safi::Unicast,
-                            next_hop: None,
-                            prefixes: vec![],
-                            labeled_prefixes: None,
-                            link_state_nlris: None,
-                            flowspec_nlris: None,
-                        })
-                        .into(),
-                    );
-                    BgpMessage::Update(BgpUpdateMessage {
-                        withdrawn_prefixes: vec![],
-                        attributes: attrs,
-                        announced_prefixes: vec![],
-                    })
-                };
-                let asn_len = if negotiated.asn4 {
-                    AsnLength::Bits32
-                } else {
-                    AsnLength::Bits16
-                };
-                write_bgp_message(&mut writer, &eor, asn_len).await?;
-            }
-        }
-
-        // Register and send the initial table under the mutation lock: a
-        // concurrent add/remove that lands between the snapshot and the
-        // registration would otherwise never reach this session, leaving it
-        // advertising a stale set until the next mutation.
+        // Register this session and send its initial table in one critical
+        // section under the mutation lock: a concurrent add/remove landing
+        // between the snapshot and the registration would otherwise never
+        // reach this session (stale set until the next mutation), and
+        // registering before the snapshot would deliver the same change twice.
+        // The End-of-RIB markers follow that single send, so the initial table
+        // reaches the peer exactly once.
         let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<SessionOp>(64);
         {
             let _guard = self.inner.prefix_ops.lock().await;
             let handle = SessionHandle {
                 tx: ctrl_tx,
-                supports_v4: negotiated.plain_ipv4()
-                    || negotiated.supports(Afi::Ipv4, Safi::Unicast),
+                supports_v4: negotiated.carries(Afi::Ipv4, Safi::Unicast),
                 supports_v6: negotiated.supports(Afi::Ipv6, Safi::Unicast),
             };
             self.inner
@@ -815,23 +812,41 @@ impl BgpService {
                 .insert(peer.address.clone(), handle);
             self.send_prefix_announcements(peer, &mut writer, &negotiated, local_ip)
                 .await?;
+            // RFC 4271 End-of-RIB: an empty UPDATE per family marks the initial
+            // table transfer complete. A capability-less RFC 4271 peer still
+            // gets the IPv4 marker, and a route server missing one treats the
+            // session as still converging.
+            for eor_family in [Afi::Ipv4, Afi::Ipv6] {
+                if negotiated.carries(eor_family, Safi::Unicast) {
+                    write_bgp_message(
+                        &mut writer,
+                        &end_of_rib(eor_family),
+                        negotiated.asn_length(),
+                    )
+                    .await?;
+                }
+            }
         }
 
-        let negotiated_hold = Duration::from_secs(hold_time as u64);
-        let keepalive_interval = Duration::from_secs((hold_time as u64 / 3).max(1));
-        let mut next_keepalive = Instant::now() + keepalive_interval;
-        let mut hold_deadline = Instant::now() + negotiated_hold;
+        // RFC 4271 s4.4: a negotiated hold time of 0 disables both the
+        // keepalive and the hold timer, so they are only armed when non-zero.
+        let keepalive_interval =
+            (hold_time != 0).then(|| Duration::from_secs((u64::from(hold_time) / 3).max(1)));
+        let mut next_keepalive = keepalive_interval.map(|interval| Instant::now() + interval);
+        let mut hold_deadline = reset_hold_deadline(hold_time);
         loop {
             let now = Instant::now();
-            if now >= next_keepalive {
+            if next_keepalive.is_some_and(|deadline| now >= deadline) {
                 write_bgp_message(&mut writer, &BgpMessage::KeepAlive, AsnLength::Bits32).await?;
-                next_keepalive = now + keepalive_interval;
+                next_keepalive = keepalive_interval.map(|interval| now + interval);
             }
-            if now >= hold_deadline {
+            if hold_deadline.is_some_and(|deadline| now >= deadline) {
                 return Err(anyhow!("hold timer expired"));
             }
             let timeout_dur = std::cmp::min(
-                next_keepalive.saturating_duration_since(now),
+                next_keepalive.map_or(Duration::from_secs(1), |next| {
+                    next.saturating_duration_since(now)
+                }),
                 Duration::from_secs(1),
             );
             // Runtime announce/withdraw commands are applied between reads; the
@@ -858,12 +873,21 @@ impl BgpService {
                                     &negotiated,
                                 )
                                 .await?;
-                                hold_deadline = Instant::now() + negotiated_hold;
+                                hold_deadline = reset_hold_deadline(hold_time);
                             }
-                            BgpMessage::KeepAlive
-                            | BgpMessage::Open(_)
-                            | BgpMessage::RouteRefresh(_) => {
-                                hold_deadline = Instant::now() + negotiated_hold;
+                            BgpMessage::RouteRefresh(refresh) => {
+                                hold_deadline = reset_hold_deadline(hold_time);
+                                self.replay_route_refresh(
+                                    peer,
+                                    &mut writer,
+                                    &negotiated,
+                                    local_ip,
+                                    &refresh,
+                                )
+                                .await?;
+                            }
+                            BgpMessage::KeepAlive | BgpMessage::Open(_) => {
+                                hold_deadline = reset_hold_deadline(hold_time);
                             }
                             BgpMessage::Notification(_) => {
                                 return Err(anyhow!("received NOTIFICATION from peer"))
@@ -909,6 +933,55 @@ impl BgpService {
         Ok(())
     }
 
+    /// RFC 2918 s4: answer a ROUTE-REFRESH by re-sending this session's
+    /// Adj-RIB-Out for the requested family, followed by that family's
+    /// End-of-RIB. A refresh for a family the session does not carry is
+    /// ignored; the caller resets the hold timer either way.
+    async fn replay_route_refresh<W: AsyncWrite + Unpin>(
+        &self,
+        peer: &PeerConfig,
+        writer: &mut W,
+        negotiated: &NegotiatedCapabilities,
+        local_ip: IpAddr,
+        refresh: &BgpRouteRefreshMessage,
+    ) -> Result<()> {
+        let (Some(afi), Some(safi)) = (refresh.afi(), refresh.safi()) else {
+            return Ok(());
+        };
+        // Subtype 1/2 (BoRR/EoRR, RFC 7313) are not implemented, and answering
+        // them as a normal refresh would send a table the peer did not ask for.
+        if refresh.subtype != 0 || !negotiated.carries(afi, safi) {
+            return Ok(());
+        }
+        let local_as = peer.local_as.unwrap_or(self.inner.global_asn);
+        let updates = {
+            // Snapshot under the mutation lock, so an incremental change cannot
+            // interleave with the replay: an earlier mutation is already in the
+            // snapshot, a later one is dispatched after the replay is written.
+            let _guard = self.inner.prefix_ops.lock().await;
+            let prefixes: Vec<PrefixEntry> = self
+                .inner
+                .prefix_state
+                .read()
+                .await
+                .effective()
+                .into_iter()
+                .filter(|entry| afi_of(&entry.network) == afi)
+                .collect();
+            build_announce_updates(
+                &prefixes,
+                self.inner.router_id,
+                local_ip,
+                local_as,
+                negotiated,
+            )
+        };
+        self.emit_updates(peer, writer, negotiated, local_ip, local_as, updates)
+            .await?;
+        write_bgp_message(writer, &end_of_rib(afi), negotiated.asn_length()).await?;
+        Ok(())
+    }
+
     /// Recomputes how many announcements this session currently carries.
     async fn refresh_advertised_count(
         &self,
@@ -944,11 +1017,7 @@ impl BgpService {
         local_as: u32,
         updates: Vec<BgpMessage>,
     ) -> Result<()> {
-        let asn_len = if negotiated.asn4 {
-            AsnLength::Bits32
-        } else {
-            AsnLength::Bits16
-        };
+        let asn_len = negotiated.asn_length();
         for update in updates {
             let raw = write_bgp_message(writer, &update, asn_len).await?;
             if let Some(archive) = &self.inner.archive {
@@ -1008,8 +1077,7 @@ impl BgpService {
         let rib = ribs.entry(peer.to_string()).or_insert_with(IpnetTrie::new);
         // Plain IPv4 NLRI is only valid on a session that carries IPv4
         // (negotiated v4 MP capability or a capability-less RFC 4271 peer).
-        let classic_ipv4_ok =
-            negotiated.plain_ipv4() || negotiated.supports(Afi::Ipv4, Safi::Unicast);
+        let classic_ipv4_ok = negotiated.carries(Afi::Ipv4, Safi::Unicast);
         for prefix in &update.withdrawn_prefixes {
             if classic_ipv4_ok {
                 rib.remove(prefix.prefix);
@@ -1414,6 +1482,58 @@ impl BgpService {
     }
 }
 
+/// RFC 4271 s4.2/s6.1 hold-time negotiation: a hold time of 0 on either side
+/// disables the timers, otherwise the smaller advertised value is the
+/// negotiated one.
+fn negotiate_hold_time(local: u16, remote: u16) -> u16 {
+    if local == 0 || remote == 0 {
+        0
+    } else {
+        local.min(remote)
+    }
+}
+
+/// Restarts the hold timer after a received message. `None` when the negotiated
+/// hold time is 0, which disables the timer (RFC 4271 s4.4).
+fn reset_hold_deadline(hold_time: u16) -> Option<Instant> {
+    (hold_time != 0).then(|| Instant::now() + Duration::from_secs(u64::from(hold_time)))
+}
+
+/// RFC 4271 End-of-RIB: an empty UPDATE marks one family's initial or refreshed
+/// table as complete. IPv4 uses the classic empty UPDATE, IPv6 the MP_UNREACH
+/// form with no NLRI.
+fn end_of_rib(family: Afi) -> BgpMessage {
+    if family == Afi::Ipv4 {
+        return BgpMessage::Update(BgpUpdateMessage::default());
+    }
+    let mut attrs = Attributes::default();
+    attrs.add_attr(
+        AttributeValue::MpUnreachNlri(Nlri {
+            afi: family,
+            safi: Safi::Unicast,
+            next_hop: None,
+            prefixes: vec![],
+            labeled_prefixes: None,
+            link_state_nlris: None,
+            flowspec_nlris: None,
+        })
+        .into(),
+    );
+    BgpMessage::Update(BgpUpdateMessage {
+        withdrawn_prefixes: vec![],
+        attributes: attrs,
+        announced_prefixes: vec![],
+    })
+}
+
+/// Address family of an originated prefix.
+fn afi_of(network: &IpNet) -> Afi {
+    match network {
+        IpNet::V4(_) => Afi::Ipv4,
+        IpNet::V6(_) => Afi::Ipv6,
+    }
+}
+
 fn local_open(
     router_id: Ipv4Addr,
     local_as: u32,
@@ -1524,13 +1644,12 @@ fn build_announce_updates(
 ) -> Vec<BgpMessage> {
     let now = unix_now();
     let mut result = Vec::new();
-    let plain_ipv4 = negotiated.plain_ipv4();
     for prefix in prefixes
         .iter()
         .filter(|prefix| matches!(prefix.network, IpNet::V4(_)))
     {
-        if plain_ipv4 || negotiated.supports(Afi::Ipv4, Safi::Unicast) {
-            let mut attrs = base_announce_attributes(local_as);
+        if negotiated.carries(Afi::Ipv4, Safi::Unicast) {
+            let mut attrs = base_announce_attributes(local_as, negotiated);
             let next_hop = prefix.next_hop.unwrap_or(IpAddr::V4(router_id));
             attrs.add_attr(AttributeValue::NextHop(next_hop).into());
             attach_dev_attr255(&mut attrs, prefix, now);
@@ -1548,7 +1667,7 @@ fn build_announce_updates(
         if !negotiated.supports(Afi::Ipv6, Safi::Unicast) {
             continue;
         }
-        let mut attrs = base_announce_attributes(local_as);
+        let mut attrs = base_announce_attributes(local_as, negotiated);
         // MP_REACH requires an IPv6 next hop. A configured non-v6 next hop is
         // ignored rather than serializing a malformed NEXT_HOP attribute.
         let next_hop = prefix
@@ -1578,7 +1697,7 @@ fn build_withdraw_updates(
     negotiated: &NegotiatedCapabilities,
 ) -> Vec<BgpMessage> {
     let mut result = Vec::new();
-    let classic_ipv4_ok = negotiated.plain_ipv4() || negotiated.supports(Afi::Ipv4, Safi::Unicast);
+    let classic_ipv4_ok = negotiated.carries(Afi::Ipv4, Safi::Unicast);
     let v4: Vec<NetworkPrefix> = networks
         .iter()
         .filter(|network| matches!(network, IpNet::V4(_)))
@@ -1621,21 +1740,38 @@ fn build_withdraw_updates(
     result
 }
 
-fn base_announce_attributes(local_as: u32) -> Attributes {
+fn base_announce_attributes(local_as: u32, negotiated: &NegotiatedCapabilities) -> Attributes {
     let mut attrs = Attributes::default();
     attrs.add_attr(AttributeValue::Origin(Origin::IGP).into());
+    // `is_as4: true` selects AS4_PATH (attribute type 17) and the encoder
+    // always writes it with 4-octet segments. On a session that negotiated
+    // 4-octet AS support the correct wire form is AS_PATH (type 2) with
+    // 4-octet segments, so `is_as4` stays false and the session AsnLength
+    // drives the width. A session without that capability cannot carry a
+    // 4-octet ASN in AS_PATH (RFC 6793 s4.2), so an unrepresentable local ASN
+    // goes into AS4_PATH while AS_TRANS takes its place in AS_PATH; a 2-octet
+    // local ASN needs neither and keeps a plain AS_PATH.
+    let (as_path, real_asn) = if !negotiated.asn4 && local_as > u32::from(u16::MAX) {
+        (u32::from(AS_TRANS), Some(local_as))
+    } else {
+        (local_as, None)
+    };
     attrs.add_attr(
         AttributeValue::AsPath {
-            path: AsPath::from_sequence([local_as]),
-            // `is_as4: true` selects AS4_PATH (attribute type 17), which is
-            // only for the RFC 6793 migration fallback. On a session that
-            // negotiated 4-octet AS, the correct wire form is AS_PATH (type 2)
-            // with 4-octet segments: keep this false and let the session
-            // AsnLength (Bits32 when AS4, Bits16 otherwise) drive the width.
+            path: AsPath::from_sequence([as_path]),
             is_as4: false,
         }
         .into(),
     );
+    if let Some(real_asn) = real_asn {
+        attrs.add_attr(
+            AttributeValue::AsPath {
+                path: AsPath::from_sequence([real_asn]),
+                is_as4: true,
+            }
+            .into(),
+        );
+    }
     attrs
 }
 
@@ -1734,6 +1870,31 @@ fn normalize_socket_addr(raw: &str, default_port: u16) -> Result<SocketAddr> {
     Ok(SocketAddr::new(address, default_port))
 }
 
+/// Per-peer TCP-MD5 keys for the listening socket: every enabled peer that
+/// has a password. A peer whose configured address is not a literal IP cannot
+/// be keyed here; the session path reports such an address.
+fn listener_md5_keys(peers: &[PeerConfig]) -> Vec<(IpAddr, String)> {
+    peers
+        .iter()
+        .filter(|peer| peer.enabled)
+        .filter_map(|peer| Some((peer.address.parse::<IpAddr>().ok()?, peer.password.clone()?)))
+        .collect()
+}
+
+/// Installs `keys` on a listening socket (RFC 2385). The port of a TCP-MD5 key
+/// is not part of the kernel's lookup (the key is per peer address, and the
+/// source port of an inbound connection is ephemeral), so the BGP port is used.
+/// A key the kernel refuses is logged rather than fatal: that peer cannot
+/// complete the handshake, but the listener still serves the others.
+fn install_listener_md5_keys(fd: i32, keys: &[(IpAddr, String)]) {
+    for (address, password) in keys {
+        let remote = SocketAddr::new(*address, 179);
+        if let Err(error) = auth::set_tcp_md5_signature(fd, &remote, password) {
+            tracing::warn!(peer=%address, error=%error, "failed to install TCP-MD5 key on the BGP listener");
+        }
+    }
+}
+
 async fn write_bgp_message<W: AsyncWrite + Unpin>(
     stream: &mut W,
     message: &BgpMessage,
@@ -1795,12 +1956,15 @@ mod tests {
 
     #[test]
     fn announce_updates_use_type2_as_path_with_negotiated_width() {
-        fn as_path_attr(msg: &BgpMessage, asn_len: AsnLength) -> (u8, Vec<u8>) {
+        /// Every AS_PATH (2) and AS4_PATH (17) attribute on the encoded
+        /// message, in wire order.
+        fn as_path_attrs(msg: &BgpMessage, asn_len: AsnLength) -> Vec<(u8, Vec<u8>)> {
             let BgpMessage::Update(u) = msg else {
                 panic!("not an UPDATE")
             };
             let mut buf = bytes::BytesMut::new();
             u.attributes.encode_to(asn_len, &mut buf).unwrap();
+            let mut attrs = Vec::new();
             let mut p = 0;
             while p < buf.len() {
                 let flags = buf[p];
@@ -1811,11 +1975,12 @@ mod tests {
                     (buf[p + 2] as usize, 3)
                 };
                 if code == 2 || code == 17 {
-                    return (code, buf[p + hdr..p + hdr + l].to_vec());
+                    attrs.push((code, buf[p + hdr..p + hdr + l].to_vec()));
                 }
                 p += hdr + l;
             }
-            panic!("no AS_PATH attribute found");
+            assert!(!attrs.is_empty(), "no AS_PATH attribute found");
+            attrs
         }
 
         let prefixes = vec![PrefixEntry {
@@ -1838,10 +2003,9 @@ mod tests {
         );
         // RFC 6793: AS4-capable session carries AS_PATH (type 2) with
         // 4-octet segments, one AS_SEQUENCE {400644} = 0x00061D04.
-        let (code, val) = as_path_attr(&updates[0], AsnLength::Bits32);
         assert_eq!(
-            (code, val.as_slice()),
-            (2u8, &[2u8, 1, 0x00, 0x06, 0x1D, 0x04][..])
+            as_path_attrs(&updates[0], AsnLength::Bits32),
+            vec![(2u8, vec![2u8, 1, 0x00, 0x06, 0x1D, 0x04])]
         );
 
         // Plain 16-bit peer (e.g. local AS 65010): type 2 with 2-octet segments.
@@ -1857,8 +2021,52 @@ mod tests {
             65010,
             &plain,
         );
-        let (code, val) = as_path_attr(&updates[0], AsnLength::Bits16);
-        assert_eq!((code, val.as_slice()), (2u8, &[2u8, 1, 0xFD, 0xF2][..]));
+        assert_eq!(
+            as_path_attrs(&updates[0], AsnLength::Bits16),
+            vec![(2u8, vec![2u8, 1, 0xFD, 0xF2])]
+        );
+
+        // RFC 6793 s4.2: a session without AS4 support cannot carry a 4-octet
+        // ASN in AS_PATH, so AS_TRANS (23456) goes there and the real ASN goes
+        // into AS4_PATH. The old encoding truncated 400644 to its low 16 bits
+        // (0x1D04 = AS 7428) on the wire.
+        let updates = build_announce_updates(
+            &prefixes,
+            "192.0.2.1".parse().unwrap(),
+            IpAddr::V4("192.0.2.1".parse().unwrap()),
+            400_644,
+            &plain,
+        );
+        assert_eq!(
+            as_path_attrs(&updates[0], AsnLength::Bits16),
+            vec![
+                (2u8, vec![2u8, 1, 0x5B, 0xA0]),
+                (17u8, vec![2u8, 1, 0x00, 0x06, 0x1D, 0x04]),
+            ]
+        );
+
+        // The pair round-trips through bgpkit-parser exactly as it goes out:
+        // AS_PATH is AS_TRANS and AS4_PATH carries the real local ASN.
+        let mut raw = updates[0].encode(AsnLength::Bits16).unwrap();
+        let parsed = parse_bgp_message(&mut raw, false, &AsnLength::Bits16).unwrap();
+        let BgpMessage::Update(parsed) = parsed else {
+            panic!("not an UPDATE")
+        };
+        let paths: Vec<(bool, String)> = parsed
+            .attributes
+            .into_attributes_iter()
+            .filter_map(|attribute| match attribute.value {
+                AttributeValue::AsPath { path, is_as4 } => Some((is_as4, path.to_string())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                (false, AS_TRANS.to_string()),
+                (true, 400_644u32.to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1876,6 +2084,106 @@ mod tests {
         assert!(negotiated.supports(Afi::Ipv6, Safi::Unicast));
         assert!(negotiated.asn4);
         assert!(negotiated.route_refresh);
+    }
+
+    #[test]
+    fn listener_md5_keys_cover_exactly_the_enabled_peers_with_passwords() {
+        let peers = vec![
+            md5_peer("192.0.2.1", true, Some("first")),
+            md5_peer("192.0.2.2", false, Some("disabled-peer")),
+            md5_peer("192.0.2.3", true, None),
+            md5_peer("2001:db8::1", true, Some("v6-peer")),
+            md5_peer("not-an-address", true, Some("unusable")),
+        ];
+        assert_eq!(
+            listener_md5_keys(&peers),
+            vec![
+                ("192.0.2.1".parse::<IpAddr>().unwrap(), "first".to_string()),
+                (
+                    "2001:db8::1".parse::<IpAddr>().unwrap(),
+                    "v6-peer".to_string()
+                ),
+            ]
+        );
+        assert!(listener_md5_keys(&[]).is_empty());
+    }
+
+    fn md5_peer(address: &str, enabled: bool, password: Option<&str>) -> PeerConfig {
+        PeerConfig {
+            address: address.to_string(),
+            remote_as: 65_002,
+            local_as: None,
+            hold_time_secs: 90,
+            connect_retry_secs: 5,
+            remote_port: 179,
+            local_address: None,
+            enabled,
+            passive: true,
+            route_refresh: true,
+            name: None,
+            password: password.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn local_open_advertises_the_configured_hold_time_including_zero() {
+        for advertised in [0u16, 30, 90] {
+            let BgpMessage::Open(open) =
+                local_open(Ipv4Addr::new(192, 0, 2, 1), 65_001, advertised, true)
+            else {
+                panic!()
+            };
+            assert_eq!(
+                open.hold_time, advertised,
+                "the OPEN must advertise the configured hold time unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn negotiated_hold_time_is_zero_if_either_side_disables_it_else_the_minimum() {
+        assert_eq!(negotiate_hold_time(0, 180), 0);
+        assert_eq!(negotiate_hold_time(90, 30), 30);
+        assert_eq!(negotiate_hold_time(90, 0), 0);
+        assert_eq!(negotiate_hold_time(90, 180), 90);
+        assert_eq!(negotiate_hold_time(30, 30), 30);
+    }
+
+    #[test]
+    fn a_capability_less_peer_still_carries_ipv4_unicast() {
+        let plain = NegotiatedCapabilities::default();
+        assert!(plain.plain_ipv4());
+        assert!(plain.carries(Afi::Ipv4, Safi::Unicast));
+        assert!(!plain.carries(Afi::Ipv6, Safi::Unicast));
+
+        let v6_only = NegotiatedCapabilities {
+            families: HashSet::from([(Afi::Ipv6, Safi::Unicast)]),
+            ..Default::default()
+        };
+        assert!(!v6_only.carries(Afi::Ipv4, Safi::Unicast));
+        assert!(v6_only.carries(Afi::Ipv6, Safi::Unicast));
+    }
+
+    #[test]
+    fn end_of_rib_markers_are_empty_per_family() {
+        let BgpMessage::Update(v4) = end_of_rib(Afi::Ipv4) else {
+            panic!("not an UPDATE")
+        };
+        assert!(v4.withdrawn_prefixes.is_empty());
+        assert!(v4.announced_prefixes.is_empty());
+        assert!(v4.attributes.into_attributes_iter().next().is_none());
+
+        let BgpMessage::Update(v6) = end_of_rib(Afi::Ipv6) else {
+            panic!("not an UPDATE")
+        };
+        assert!(v6.withdrawn_prefixes.is_empty());
+        assert!(v6.announced_prefixes.is_empty());
+        let unreach = v6
+            .attributes
+            .get_unreachable_nlri()
+            .expect("MP_UNREACH present");
+        assert_eq!(unreach.afi, Afi::Ipv6);
+        assert!(unreach.prefixes.is_empty());
     }
 
     #[test]

@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixes
+
+* **TCP-MD5 on the passive listener** - the per-peer keys are installed on the listening socket (Linux `TCP_MD5SIG`) before the accept loop, because the kernel validates the digest on the SYN and `accept()` never returns for a peer whose key is missing; the key is still applied to the accepted socket as well.
+* **RFC 4271 hold time** - OPEN advertises the configured hold time unchanged (0 disables the timers instead of being raised to 3), the remote OPEN's hold time is taken into account (0 on either side disables the timers, otherwise the smaller value wins), and the keepalive and hold timers are driven by that negotiated value.
+* **RFC 6793 AS4_PATH fallback** - a session that did not negotiate the four-octet AS capability now carries `AS_TRANS` in AS_PATH and the real local ASN in AS4_PATH instead of a truncated 2-octet AS_PATH.
+* **RFC 2918 route refresh replay** - a received ROUTE-REFRESH for a negotiated family re-sends that family's Adj-RIB-Out followed by its End-of-RIB (the hold timer reset is unchanged); a refresh for a family the session does not carry is ignored, and the RFC 7313 BoRR/EoRR subtypes are not implemented.
+* **End-of-RIB for a capability-less peer** - the IPv4 End-of-RIB decision now agrees with the announcement decision, so a plain RFC 4271 peer that negotiated no capabilities gets its IPv4 marker.
+* **One initial table send** - the establishment table is sent exactly once, inside the registration critical section, with the End-of-RIB markers after it; the previous pre-lock send re-sent every copy after the EoR and archived it twice.
+* The TCP-MD5 socket helpers are re-exported as `focl::bgp::{TcpSocketExt, TcpStreamExt}`.
+
 ### New features
 
 * **Real peering collector (Phase 1)** - the established session loop no longer discards UPDATEs: raw frames go to the archive and parsed prefixes fill a per-peer Adj-RIB-In that `focl rib in` reads, cleared on session end. OPEN advertises MP-BGP IPv4 and IPv6 unicast plus four-octet AS (AS_TRANS on the wire for a 4-byte local ASN) and, when configured, route refresh; peer capabilities are parsed from the raw frame with negotiated families, ASN4 and route refresh tracked per session, and the remote ASN validated including AS_TRANS resolution. A peer that negotiates no capabilities still establishes plain IPv4 unicast. IPv4 prefixes are announced with classic NLRI and NEXT_HOP, IPv6 through MP_REACH_NLRI, and an invalid non-IPv6 configured next hop is rejected instead of malformed-encoded.
