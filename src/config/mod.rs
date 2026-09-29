@@ -67,6 +67,12 @@ impl FoclConfig {
             prefix.network.parse::<IpNet>().with_context(|| {
                 format!("invalid IP prefix in [[prefixes]]: {}", prefix.network)
             })?;
+            if prefix.dev_attr255_interval_secs == Some(0) {
+                bail!(
+                    "[[prefixes]] {} has invalid dev_attr255_interval_secs; must be > 0",
+                    prefix.network
+                );
+            }
         }
 
         self.archive.validate()?;
@@ -152,6 +158,11 @@ pub struct PrefixConfig {
     pub network: String,
     #[serde(default)]
     pub next_hop: Option<String>,
+    /// Attaches attribute 255 (reserved for development, RFC 2042) to this
+    /// prefix's announcements, carrying a BGPKIT clock payload, re-announced
+    /// every N seconds. Absent = no attribute.
+    #[serde(default)]
+    pub dev_attr255_interval_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,6 +546,53 @@ layout_profile = "routeviews"
 
         let cfg: FoclConfig = toml::from_str(raw).expect("toml should parse");
         assert_eq!(cfg.archive.layout_profile, LayoutProfile::RouteViews);
+    }
+
+    #[test]
+    fn prefix_config_roundtrips_dev_attr255_interval() {
+        let raw = r#"
+[global]
+asn = 65001
+router_id = "192.0.2.1"
+
+[[prefixes]]
+network = "2001:db8::/48"
+dev_attr255_interval_secs = 1800
+
+[[prefixes]]
+network = "192.0.2.0/24"
+"#;
+        let cfg: FoclConfig = toml::from_str(raw).expect("toml should parse");
+        assert_eq!(cfg.prefixes[0].dev_attr255_interval_secs, Some(1800));
+        assert_eq!(cfg.prefixes[1].dev_attr255_interval_secs, None);
+
+        let encoded = toml::to_string(&cfg).expect("config should serialize");
+        let reparsed: FoclConfig = toml::from_str(&encoded).expect("roundtrip should parse");
+        assert_eq!(reparsed.prefixes[0].dev_attr255_interval_secs, Some(1800));
+        assert_eq!(reparsed.prefixes[1].dev_attr255_interval_secs, None);
+    }
+
+    #[test]
+    fn rejects_zero_dev_attr255_interval() {
+        let raw = r#"
+[global]
+asn = 65001
+router_id = "192.0.2.1"
+
+[[prefixes]]
+network = "192.0.2.0/24"
+dev_attr255_interval_secs = 0
+"#;
+        let cfg: FoclConfig = toml::from_str(raw).expect("toml should parse");
+        let error = cfg
+            .validate()
+            .expect_err("a zero refresh interval must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("dev_attr255_interval_secs; must be > 0"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
