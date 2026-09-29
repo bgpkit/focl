@@ -625,7 +625,7 @@ impl BgpService {
         for interval in intervals {
             let service = self.clone();
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(u64::from(interval)));
+                let mut ticker = clock_ticker(interval);
                 // The establishment announcement already covers t0.
                 ticker.tick().await;
                 loop {
@@ -1007,28 +1007,29 @@ impl BgpService {
             return Ok(());
         }
         let local_as = peer.local_as.unwrap_or(self.inner.global_asn);
-        let updates = {
-            // Snapshot under the mutation lock, so an incremental change cannot
-            // interleave with the replay: an earlier mutation is already in the
-            // snapshot, a later one is dispatched after the replay is written.
-            let _guard = self.inner.prefix_ops.lock().await;
-            let prefixes: Vec<PrefixEntry> = self
-                .inner
-                .prefix_state
-                .read()
-                .await
-                .effective()
-                .into_iter()
-                .filter(|entry| afi_of(&entry.network) == afi)
-                .collect();
-            build_announce_updates(
-                &prefixes,
-                self.inner.router_id,
-                local_ip,
-                local_as,
-                negotiated,
-            )
-        };
+        // The mutation lock is deliberately not taken here. A control client
+        // holds it across its dispatch, and a dispatch blocked on this
+        // session's full queue can only be unblocked by this loop draining it,
+        // so a lock wait here deadlocks the session against its own producer.
+        // Ordering comes from this loop instead: the state read below is one
+        // atomic view, a mutation applied before it is inside the replay, and a
+        // later one is written after it.
+        let prefixes: Vec<PrefixEntry> = self
+            .inner
+            .prefix_state
+            .read()
+            .await
+            .effective()
+            .into_iter()
+            .filter(|entry| afi_of(&entry.network) == afi)
+            .collect();
+        let updates = build_announce_updates(
+            &prefixes,
+            self.inner.router_id,
+            local_ip,
+            local_as,
+            negotiated,
+        );
         self.emit_updates(peer, writer, negotiated, local_ip, local_as, updates)
             .await?;
         write_bgp_message(writer, &end_of_rib(afi), negotiated.asn_length()).await?;
@@ -1689,6 +1690,16 @@ fn afi_of(network: &IpNet) -> Afi {
         IpNet::V4(_) => Afi::Ipv4,
         IpNet::V6(_) => Afi::Ipv6,
     }
+}
+
+/// The refresh ticker for one attribute-255 interval. Missed ticks are skipped
+/// rather than burst: after a stall the same clock round would otherwise be
+/// dispatched once per missed tick, which can fill a session queue without
+/// recovering any measurement.
+fn clock_ticker(interval_secs: u32) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(Duration::from_secs(u64::from(interval_secs)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
 }
 
 fn local_open(
@@ -3064,5 +3075,82 @@ enabled = false
         let again = service.prefix_remove(network, false).await.unwrap();
         assert!(!again.changed);
         assert_eq!(again.source, None);
+    }
+
+    /// The session loop must answer a ROUTE-REFRESH while a control client
+    /// holds the mutation lock: the loop is the only drain for its own queue,
+    /// so waiting on a lock a blocked producer holds would never resolve.
+    #[tokio::test]
+    async fn route_refresh_replay_does_not_wait_for_the_mutation_lock() {
+        let cfg = test_service_config();
+        let (event_tx, _) = broadcast::channel::<EventEnvelope>(4);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+        let network: IpNet = "198.51.100.0/24".parse().unwrap();
+        service.prefix_add(network, None, false).await.unwrap();
+
+        let peer = PeerConfig {
+            address: "192.0.2.9".to_string(),
+            remote_as: 65_002,
+            local_as: None,
+            hold_time_secs: 30,
+            connect_retry_secs: 1,
+            remote_port: 179,
+            local_address: None,
+            enabled: true,
+            passive: true,
+            route_refresh: true,
+            name: None,
+            password: None,
+        };
+        let negotiated = NegotiatedCapabilities {
+            families: HashSet::from([(Afi::Ipv4, Safi::Unicast)]),
+            asn4: true,
+            route_refresh: true,
+            graceful_restart: false,
+        };
+        let refresh = BgpRouteRefreshMessage {
+            afi: 1,
+            subtype: 0,
+            safi: 1,
+            data: vec![],
+        };
+
+        let guard = service.inner.prefix_ops.lock().await;
+        let mut out = Vec::new();
+        timeout(
+            Duration::from_secs(5),
+            service.replay_route_refresh(
+                &peer,
+                &mut out,
+                &negotiated,
+                "192.0.2.1".parse().unwrap(),
+                &refresh,
+            ),
+        )
+        .await
+        .expect("the replay must not wait for the mutation lock")
+        .unwrap();
+        drop(guard);
+
+        assert!(
+            !out.is_empty(),
+            "the replay writes the table and the family's End-of-RIB"
+        );
+    }
+
+    /// A stalled clock task must not replay every missed tick: the same round
+    /// would be dispatched once per tick and can fill a session queue.
+    #[tokio::test(start_paused = true)]
+    async fn clock_ticker_skips_missed_ticks() {
+        let mut ticker = clock_ticker(30);
+        ticker.tick().await;
+        tokio::time::advance(Duration::from_secs(95)).await;
+
+        let mut immediate = 0;
+        while timeout(Duration::ZERO, ticker.tick()).await.is_ok() {
+            immediate += 1;
+            assert!(immediate < 4, "a stall must not burst the missed ticks");
+        }
+        assert_eq!(immediate, 1, "one tick after a stall, not three");
     }
 }

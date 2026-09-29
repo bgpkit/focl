@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_types::region::Region;
 use tokio::time::sleep;
@@ -150,8 +150,15 @@ impl Replicator {
             .path
             .as_ref()
             .context("local destination path missing")?;
-        let relative_path = PathBuf::from(&manifest.relative_path);
+        let relative_path = contained_relative_path(manifest)?;
         let target_segment = base.join(&relative_path);
+        if !target_segment.starts_with(base) {
+            bail!(
+                "manifest path {} escapes the destination root {}",
+                manifest.relative_path,
+                base.display()
+            );
+        }
         let target_manifest = PathBuf::from(format!("{}.json", target_segment.display()));
 
         if let Some(parent) = target_segment.parent() {
@@ -207,7 +214,8 @@ impl Replicator {
 
         let client = aws_sdk_s3::Client::from_conf(s3_conf);
 
-        let key = object_key(prefix, &manifest.relative_path);
+        let relative_path = contained_relative_path(manifest)?;
+        let key = object_key(prefix, &relative_path.to_string_lossy());
         let manifest_key = format!("{}.json", key);
 
         let body = ByteStream::from_path(Path::new(&job.segment_path)).await?;
@@ -252,4 +260,113 @@ fn object_key(prefix: &str, relative: &str) -> String {
 
     let normalized_prefix = prefix.trim_matches('/');
     format!("{}/{}", normalized_prefix, relative.trim_start_matches('/'))
+}
+
+/// Resolves a manifest's relative path, refusing anything that is not a plain
+/// relative path. The queue is re-read from disk on every retry, so a manifest
+/// changed after it was queued must not be able to redirect the copy: an
+/// absolute path discards the destination root in `Path::join`, and a `..`
+/// component climbs out of it.
+fn contained_relative_path(manifest: &SegmentManifest) -> Result<PathBuf> {
+    let mut safe = PathBuf::new();
+    for component in Path::new(&manifest.relative_path).components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            _ => bail!(
+                "manifest relative path is not a plain relative path: {}",
+                manifest.relative_path
+            ),
+        }
+    }
+    if safe.as_os_str().is_empty() {
+        bail!("manifest relative path is empty");
+    }
+    Ok(safe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CompressionKind, LayoutProfile};
+
+    fn manifest(relative_path: &str) -> SegmentManifest {
+        SegmentManifest {
+            collector_id: "test".to_string(),
+            stream: "updates".to_string(),
+            start_ts: 0,
+            end_ts: 1,
+            record_count: 1,
+            bytes: 1,
+            sha256: "0".repeat(64),
+            compression: CompressionKind::Gzip,
+            layout_profile: LayoutProfile::RouteViews,
+            relative_path: relative_path.to_string(),
+        }
+    }
+
+    #[test]
+    fn manifest_paths_must_stay_relative() {
+        for path in [
+            "/etc/passwd",
+            "../escaped.gz",
+            "a/../../escaped.gz",
+            "..",
+            "",
+        ] {
+            assert!(
+                contained_relative_path(&manifest(path)).is_err(),
+                "{path} must be refused"
+            );
+        }
+        assert_eq!(
+            contained_relative_path(&manifest("route-views2/bgpdata/updates.1700000000.gz"))
+                .expect("a plain relative path is accepted"),
+            PathBuf::from("route-views2/bgpdata/updates.1700000000.gz")
+        );
+    }
+
+    /// The retry path re-reads the manifest from disk, so a queued manifest
+    /// that was changed afterwards must not be able to write outside the
+    /// replica root.
+    #[test]
+    fn copy_to_local_refuses_a_manifest_that_escapes_the_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let replica = temp.path().join("replica");
+        let mut cfg = ArchiveConfig::default();
+        cfg.destinations[0].path = Some(replica.clone());
+        let destination = cfg.destinations[0].clone();
+        assert!(
+            matches!(destination.destination_type, DestinationType::Local),
+            "the default destination is a local one"
+        );
+        let replicator = Replicator::new(
+            &cfg,
+            ReplicationQueue::new(&temp.path().join("queue"))?,
+            None,
+        );
+
+        let segment = temp.path().join("updates.1700000000.gz");
+        fs::write(&segment, b"segment")?;
+        let job = ReplicationJob {
+            id: 1,
+            segment_path: segment,
+            manifest_path: temp.path().join("manifest.json"),
+            destination_key: destination.destination_key(),
+            attempts: 1,
+            max_retries: 3,
+        };
+
+        let error = replicator
+            .copy_to_local(&destination, &job, &manifest("../escaped.gz"))
+            .expect_err("a path leaving the replica root must be refused");
+        assert!(
+            error.to_string().contains("not a plain relative path"),
+            "{error}"
+        );
+        assert!(
+            !temp.path().join("escaped.gz").exists(),
+            "nothing may be written outside the replica root"
+        );
+        Ok(())
+    }
 }
