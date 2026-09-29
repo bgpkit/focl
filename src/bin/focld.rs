@@ -40,6 +40,9 @@ async fn main() -> Result<()> {
     let archive = ArchiveService::new(cfg.archive.clone(), collector_bgp_id).await?;
     let events_tx = archive.event_sender();
     let bgp = BgpService::new_with_archive(&cfg, events_tx, Some(Arc::clone(&archive))).await?;
+    // The speaker is the archive's RIB view source: a snapshot reads the live
+    // Adj-RIB-In from the service that owns it.
+    archive.set_snapshot_source(Arc::new(bgp.clone()));
 
     let socket_path = cfg.global.control_socket.clone();
     cleanup_socket(&socket_path)?;
@@ -224,14 +227,7 @@ async fn handle_client(
                 ControlResponse::ok(req.id, json!({"ok": true}))
             }
             CommandKind::ArchiveSnapshotNow => {
-                let snapshot = focl::archive::types::RibSnapshotInput {
-                    timestamp: chrono::Utc::now().timestamp(),
-                    collector_bgp_id: std::net::Ipv4Addr::UNSPECIFIED,
-                    view_name: "main".to_string(),
-                    peers: vec![],
-                    routes: vec![],
-                };
-                let result = archive.snapshot_now(snapshot).await?;
+                let result = archive.snapshot_current().await?;
                 ControlResponse::ok(
                     req.id,
                     json!({

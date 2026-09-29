@@ -46,6 +46,18 @@ pub fn encode_bgp4mp_message_as4(input: &UpdateRecordInput) -> Result<Vec<u8>> {
 /// embedded BGP UPDATE. The archive always uses this path so malformed yet
 /// archivable frames retain their exact original bytes.
 pub fn encode_bgp4mp_raw_as4(input: &UpdateRecordInput) -> Result<Vec<u8>> {
+    encode_bgp4mp_raw(input, Bgp4MpType::MessageAs4)
+}
+
+/// The same raw envelope for a message this speaker generated. RFC 6396
+/// section 4.4.6 reserves `BGP4MP_MESSAGE_AS4_LOCAL` (7) for locally
+/// generated messages, so a consumer does not read our own announcements as
+/// updates received from the remote peer.
+pub fn encode_bgp4mp_raw_as4_local(input: &UpdateRecordInput) -> Result<Vec<u8>> {
+    encode_bgp4mp_raw(input, Bgp4MpType::MessageAs4Local)
+}
+
+fn encode_bgp4mp_raw(input: &UpdateRecordInput, msg_type: Bgp4MpType) -> Result<Vec<u8>> {
     let (address_family, peer_address, local_address) = match (input.peer_ip, input.local_ip) {
         (IpAddr::V4(peer), IpAddr::V4(local)) => {
             (1_u16, peer.octets().to_vec(), local.octets().to_vec())
@@ -69,7 +81,7 @@ pub fn encode_bgp4mp_raw_as4(input: &UpdateRecordInput) -> Result<Vec<u8>> {
     encode_common_header(
         input.timestamp as u32,
         EntryType::BGP4MP,
-        Bgp4MpType::MessageAs4 as u16,
+        msg_type as u16,
         payload,
     )
 }
@@ -312,7 +324,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
         );
-        assert_raw_bgp4mp_round_trip(&input)
+        assert_raw_bgp4mp_round_trip(&input, Bgp4MpType::MessageAs4)
     }
 
     #[test]
@@ -321,7 +333,18 @@ mod tests {
             IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
             IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
         );
-        assert_raw_bgp4mp_round_trip(&input)
+        assert_raw_bgp4mp_round_trip(&input, Bgp4MpType::MessageAs4)
+    }
+
+    /// A locally generated message is archived under the local subtype, so a
+    /// consumer can tell our own announcements from received updates.
+    #[test]
+    fn raw_bgp4mp_local_uses_the_local_subtype() -> Result<()> {
+        let input = update_input(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+        );
+        assert_raw_bgp4mp_round_trip(&input, Bgp4MpType::MessageAs4Local)
     }
 
     #[test]
@@ -456,18 +479,23 @@ mod tests {
         }
     }
 
-    fn assert_raw_bgp4mp_round_trip(input: &UpdateRecordInput) -> Result<()> {
-        let bytes = encode_bgp4mp_raw_as4(input)?;
+    fn assert_raw_bgp4mp_round_trip(input: &UpdateRecordInput, msg_type: Bgp4MpType) -> Result<()> {
+        let bytes = match msg_type {
+            Bgp4MpType::MessageAs4 => encode_bgp4mp_raw_as4(input)?,
+            Bgp4MpType::MessageAs4Local => encode_bgp4mp_raw_as4_local(input)?,
+            other => bail!("unexpected BGP4MP subtype in this test: {other:?}"),
+        };
         let parsed = parse_mrt_record(&mut Cursor::new(&bytes))?;
         assert_eq!(parsed.common_header.entry_type, EntryType::BGP4MP);
-        assert_eq!(
-            parsed.common_header.entry_subtype,
-            Bgp4MpType::MessageAs4 as u16
-        );
+        assert_eq!(parsed.common_header.entry_subtype, msg_type as u16);
         match parsed.message {
             MrtMessage::Bgp4Mp(Bgp4MpEnum::Message(message)) => {
                 assert_eq!(message.peer_ip, input.peer_ip);
                 assert_eq!(message.local_ip, input.local_ip);
+                assert_eq!(
+                    message.is_local(),
+                    matches!(msg_type, Bgp4MpType::MessageAs4Local)
+                );
                 let decoded = message
                     .bgp_message
                     .encode(AsnLength::Bits32)

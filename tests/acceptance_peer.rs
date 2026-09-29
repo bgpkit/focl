@@ -6,8 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bgpkit_parser::bgp::parse_bgp_message;
 use bgpkit_parser::models::{
-    Afi, AsPath, Asn, AsnLength, AttrFlags, AttributeValue, Attributes, BgpMessage, BgpOpenMessage,
-    BgpRouteRefreshMessage, BgpUpdateMessage, NetworkPrefix, Nlri, OptParam, Origin, ParamValue,
+    Afi, AsPath, Asn, AsnLength, AttrFlags, AttributeValue, Attributes, Bgp4MpEnum, BgpMessage,
+    BgpOpenMessage, BgpRouteRefreshMessage, BgpState, BgpUpdateMessage, MrtMessage, NetworkPrefix,
+    Nlri, OptParam, Origin, ParamValue, TableDumpV2Message, TableDumpV2Type,
 };
 use bgpkit_parser::parse_mrt_record;
 use bytes::Bytes;
@@ -164,8 +165,17 @@ async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()
     GzDecoder::new(std::fs::File::open(segment)?).read_to_end(&mut decoded)?;
     let mut cursor = Cursor::new(decoded);
     let mut record_count = 0;
+    let mut local_records = 0;
+    let mut received_records = 0;
     while (cursor.position() as usize) < cursor.get_ref().len() {
-        parse_mrt_record(&mut cursor)?;
+        let record = parse_mrt_record(&mut cursor)?;
+        if let MrtMessage::Bgp4Mp(Bgp4MpEnum::Message(message)) = &record.message {
+            if message.is_local() {
+                local_records += 1;
+            } else {
+                received_records += 1;
+            }
+        }
         record_count += 1;
     }
     // one outbound UPDATE per configured prefix plus the two peer UPDATEs, and
@@ -173,6 +183,249 @@ async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()
     assert!(
         record_count >= 4,
         "expected both directions in archived BGP4MP records"
+    );
+    // Our own announcements are archived in the local direction (RFC 6396
+    // section 4.4.6); the peer's updates keep the received direction.
+    assert!(
+        local_records >= 2,
+        "expected at least two locally generated records, got {local_records}"
+    );
+    assert!(
+        received_records >= 2,
+        "expected at least two received records, got {received_records}"
+    );
+    Ok(())
+}
+
+/// The archive's periodic RIB snapshot is built from the speaker's live
+/// Adj-RIB-In: the segment carries a peer index table plus one RIB entry per
+/// received route and parses as TABLE_DUMP_V2.
+#[tokio::test]
+async fn rib_snapshot_carries_the_live_adj_rib_in() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let archive_root = temp.path().join("archive");
+    let cfg = FoclConfig {
+        global: GlobalConfig {
+            asn: FOCL_AS,
+            router_id: "192.0.2.1".to_string(),
+            listen: true,
+            listen_addr: format!("127.0.0.1:{port}"),
+            control_socket: temp.path().join("focld.sock"),
+            log_level: "warn".to_string(),
+        },
+        peers: vec![PeerConfig {
+            address: "127.0.0.1".to_string(),
+            remote_as: PEER_AS,
+            local_as: None,
+            hold_time_secs: 30,
+            connect_retry_secs: 1,
+            remote_port: port,
+            local_address: None,
+            enabled: true,
+            passive: true,
+            route_refresh: true,
+            name: None,
+            password: None,
+        }],
+        prefixes: vec![],
+        archive: ArchiveConfig {
+            enabled: true,
+            root: archive_root.clone(),
+            tmp_root: archive_root.join(".tmp"),
+            ..ArchiveConfig::default()
+        },
+    };
+    let archive = ArchiveService::new(cfg.archive.clone(), Ipv4Addr::new(192, 0, 2, 1)).await?;
+    let bgp =
+        BgpService::new_with_archive(&cfg, archive.event_sender(), Some(Arc::clone(&archive)))
+            .await?;
+    // The daemon wires the speaker in as the archive's RIB view source.
+    archive.set_snapshot_source(Arc::new(bgp.clone()));
+
+    let mut stream = establish_peer_session(port, capabilities()).await?;
+    write_message(
+        &mut stream,
+        &announce_v4("192.0.2.0/24", "192.0.2.2".parse()?),
+    )
+    .await?;
+    write_message(
+        &mut stream,
+        &announce_v6("2001:db8::/32", "2001:db8::2".parse()?),
+    )
+    .await?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let prefixes = bgp.rib_in("127.0.0.1").await?;
+            if prefixes.iter().any(|prefix| prefix == "192.0.2.0/24")
+                && prefixes.iter().any(|prefix| prefix == "2001:db8::/32")
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await??;
+
+    archive.rollover(ArchiveStream::Ribs).await?;
+
+    let segment = walkdir::WalkDir::new(&archive_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            (entry.file_type().is_file() && name.starts_with("rib.") && name.ends_with(".gz"))
+                .then(|| entry.path().to_path_buf())
+        })
+        .context("a RIB rollover should write a rib segment for the received routes")?;
+    let mut decoded = Vec::new();
+    GzDecoder::new(std::fs::File::open(segment)?).read_to_end(&mut decoded)?;
+    let mut cursor = Cursor::new(decoded);
+
+    let MrtMessage::TableDumpV2Message(TableDumpV2Message::PeerIndexTable(table)) =
+        parse_mrt_record(&mut cursor)?.message
+    else {
+        panic!("the RIB segment must start with a peer index table");
+    };
+    assert_eq!(table.id_peer_map.len(), 1, "one session, one peer entry");
+    let peer = table.id_peer_map.get(&0).context("peer index 0 is used")?;
+    assert_eq!(peer.peer_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    assert_eq!(peer.peer_asn.to_u32(), PEER_AS);
+    assert_eq!(peer.peer_bgp_id, Ipv4Addr::new(192, 0, 2, 2));
+
+    let MrtMessage::TableDumpV2Message(TableDumpV2Message::RibAfi(v4)) =
+        parse_mrt_record(&mut cursor)?.message
+    else {
+        panic!("expected a RIB AFI entry for the IPv4 route");
+    };
+    assert_eq!(v4.rib_type, TableDumpV2Type::RibIpv4Unicast);
+    assert_eq!(v4.prefix.prefix.to_string(), "192.0.2.0/24");
+    assert_eq!(v4.rib_entries.len(), 1);
+    assert_eq!(v4.rib_entries[0].peer_index, 0);
+    assert_eq!(
+        v4.rib_entries[0].attributes.next_hop(),
+        Some("192.0.2.2".parse::<IpAddr>()?)
+    );
+    assert_eq!(
+        v4.rib_entries[0]
+            .attributes
+            .as_path()
+            .map(ToString::to_string),
+        Some(PEER_AS.to_string())
+    );
+
+    let MrtMessage::TableDumpV2Message(TableDumpV2Message::RibAfi(v6)) =
+        parse_mrt_record(&mut cursor)?.message
+    else {
+        panic!("expected a RIB AFI entry for the IPv6 route");
+    };
+    assert_eq!(v6.rib_type, TableDumpV2Type::RibIpv6Unicast);
+    assert_eq!(v6.prefix.prefix.to_string(), "2001:db8::/32");
+    assert_eq!(v6.rib_entries.len(), 1);
+    assert_eq!(v6.rib_entries[0].peer_index, 0);
+    Ok(())
+}
+
+/// Ending a session records the exit transition: clearing the RIB drops the
+/// session's local address, so the state change has to be archived first or it
+/// is lost.
+#[tokio::test]
+async fn session_end_archives_the_established_to_active_transition() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let archive_root = temp.path().join("archive");
+    let cfg = FoclConfig {
+        global: GlobalConfig {
+            asn: FOCL_AS,
+            router_id: "192.0.2.1".to_string(),
+            listen: true,
+            listen_addr: format!("127.0.0.1:{port}"),
+            control_socket: temp.path().join("focld.sock"),
+            log_level: "warn".to_string(),
+        },
+        peers: vec![PeerConfig {
+            address: "127.0.0.1".to_string(),
+            remote_as: PEER_AS,
+            local_as: None,
+            hold_time_secs: 30,
+            connect_retry_secs: 1,
+            remote_port: port,
+            local_address: None,
+            enabled: true,
+            passive: true,
+            route_refresh: true,
+            name: None,
+            password: None,
+        }],
+        prefixes: vec![],
+        archive: ArchiveConfig {
+            enabled: true,
+            root: archive_root.clone(),
+            tmp_root: archive_root.join(".tmp"),
+            ..ArchiveConfig::default()
+        },
+    };
+    let archive = ArchiveService::new(cfg.archive.clone(), Ipv4Addr::new(192, 0, 2, 1)).await?;
+    let _bgp =
+        BgpService::new_with_archive(&cfg, archive.event_sender(), Some(Arc::clone(&archive)))
+            .await?;
+
+    let stream = establish_peer_session(port, capabilities()).await?;
+    // Establishment archives OpenSent, OpenConfirm and Established. With no
+    // configured prefixes nothing else is archived while the session is quiet,
+    // so the record count can only move again when the session ends.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if archive.status().await?.updates_record_count >= 3 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("the establishment state changes should be archived")??;
+    let before = archive.status().await?.updates_record_count;
+
+    drop(stream);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if archive.status().await?.updates_record_count > before {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("ending the session should archive a record")??;
+
+    archive.rollover(ArchiveStream::Updates).await?;
+
+    let mut transition = None;
+    for entry in walkdir::WalkDir::new(&archive_root) {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !entry.file_type().is_file() || !name.ends_with(".gz") {
+            continue;
+        }
+        let mut decoded = Vec::new();
+        GzDecoder::new(std::fs::File::open(entry.path())?).read_to_end(&mut decoded)?;
+        let mut cursor = Cursor::new(decoded);
+        while (cursor.position() as usize) < cursor.get_ref().len() {
+            let record = parse_mrt_record(&mut cursor)?;
+            if let MrtMessage::Bgp4Mp(Bgp4MpEnum::StateChange(state)) = record.message {
+                if state.old_state == BgpState::Established && state.new_state == BgpState::Active {
+                    transition = Some(state);
+                }
+            }
+        }
+    }
+
+    let transition =
+        transition.context("the Established -> Active transition should be archived")?;
+    assert_eq!(transition.peer_ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    assert_eq!(
+        transition.local_addr,
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
     );
     Ok(())
 }

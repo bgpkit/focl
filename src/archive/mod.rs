@@ -6,8 +6,10 @@ pub mod snapshot;
 pub mod types;
 pub mod writer;
 
+use std::future::Future;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,7 +19,8 @@ use tokio::sync::{broadcast, Mutex};
 use crate::archive::layout::{aligned_epoch, segment_paths};
 use crate::archive::replicator::Replicator;
 use crate::archive::snapshot::{
-    build_table_dump_v2, encode_bgp4mp_raw_as4, encode_bgp4mp_state_change_as4,
+    build_table_dump_v2, encode_bgp4mp_raw_as4, encode_bgp4mp_raw_as4_local,
+    encode_bgp4mp_state_change_as4,
 };
 use crate::archive::types::{
     ArchiveStatus, ArchiveStream, FinalizedSegment, PeerStateRecordInput, RibSnapshotInput,
@@ -27,12 +30,28 @@ use crate::archive::writer::SegmentWriter;
 use crate::config::{ArchiveConfig, DestinationMode};
 use crate::types::{Event, EventEnvelope};
 
+/// Future returned by [`RibSnapshotSource::snapshot_input`]. A boxed future
+/// keeps the source a plain trait object; there is exactly one implementation
+/// and it is called once per RIB interval.
+pub type SnapshotInputFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<RibSnapshotInput>> + Send + 'a>>;
+
+/// Supplies the live RIB view an archive snapshot is built from. The speaker
+/// implements it over the state its sessions already track; the archive owns
+/// the snapshot timing, so the source does not need to stamp a usable
+/// timestamp (the archive overwrites it) and may leave the collector id
+/// unspecified.
+pub trait RibSnapshotSource: Send + Sync {
+    fn snapshot_input(&self) -> SnapshotInputFuture<'_>;
+}
+
 pub struct ArchiveService {
     cfg: ArchiveConfig,
     collector_bgp_id: Ipv4Addr,
     updates_writer: Mutex<Option<SegmentWriter>>,
     ribs_last: Mutex<Option<FinalizedSegment>>,
     last_rib_bucket: Mutex<Option<i64>>,
+    snapshot_source: OnceLock<Arc<dyn RibSnapshotSource>>,
     replicator: Option<Arc<Replicator>>,
     event_tx: broadcast::Sender<EventEnvelope>,
 }
@@ -69,6 +88,7 @@ impl ArchiveService {
             updates_writer: Mutex::new(None),
             ribs_last: Mutex::new(None),
             last_rib_bucket: Mutex::new(None),
+            snapshot_source: OnceLock::new(),
             replicator,
             event_tx,
         });
@@ -111,6 +131,14 @@ impl ArchiveService {
             .collect()
     }
 
+    /// Registers the RIB view source. The daemon calls this once, after both
+    /// the archive and the speaker exist.
+    pub fn set_snapshot_source(&self, source: Arc<dyn RibSnapshotSource>) {
+        if self.snapshot_source.set(source).is_err() {
+            tracing::warn!("RIB snapshot source is already registered");
+        }
+    }
+
     pub async fn ingest_update(&self, update: UpdateRecordInput) -> Result<()> {
         if !self.cfg.enabled {
             return Ok(());
@@ -119,11 +147,29 @@ impl ArchiveService {
         // Segment selection is driven exclusively by the ingestion-clock tick.
         // Event timestamps are preserved in MRT records, never used to reopen buckets.
         let record = encode_bgp4mp_raw_as4(&update)?;
+        self.write_update_record(&record).await
+    }
+
+    /// Archives a message this speaker generated. RFC 6396 section 4.4.6
+    /// reserves `BGP4MP_MESSAGE_AS4_LOCAL` for locally generated messages, so
+    /// a consumer can tell our own announcements from updates received from
+    /// the peer instead of reading both as received. Both directions stay
+    /// archived.
+    pub async fn ingest_local_update(&self, update: UpdateRecordInput) -> Result<()> {
+        if !self.cfg.enabled {
+            return Ok(());
+        }
+
+        let record = encode_bgp4mp_raw_as4_local(&update)?;
+        self.write_update_record(&record).await
+    }
+
+    async fn write_update_record(&self, record: &[u8]) -> Result<()> {
         let mut writer_guard = self.updates_writer.lock().await;
         let writer = writer_guard
             .as_mut()
             .context("updates writer not initialized")?;
-        writer.write_record(&record)?;
+        writer.write_record(record)?;
 
         Ok(())
     }
@@ -192,6 +238,51 @@ impl ArchiveService {
         Ok(finalized)
     }
 
+    /// Forces a RIB segment from the registered source for an explicit
+    /// `archive snapshot-now` request. Unlike the scheduled snapshot, an
+    /// explicit request writes the segment even when the view has no routes.
+    pub async fn snapshot_current(&self) -> Result<FinalizedSegment> {
+        let now = Utc::now().timestamp();
+        let input = self
+            .snapshot_input_from_source(now)
+            .await?
+            .unwrap_or_else(|| RibSnapshotInput {
+                timestamp: now,
+                collector_bgp_id: Ipv4Addr::UNSPECIFIED,
+                view_name: "main".to_string(),
+                peers: vec![],
+                routes: vec![],
+            });
+        self.snapshot_now(input).await
+    }
+
+    /// Writes a RIB segment from the registered source. A view without routes
+    /// yields no segment: the archive must not publish a RIB file before a
+    /// valid baseline exists, which also keeps a rollover on an empty view
+    /// from writing an empty file.
+    async fn snapshot_from_source(&self, now_ts: i64) -> Result<Option<FinalizedSegment>> {
+        let Some(input) = self.snapshot_input_from_source(now_ts).await? else {
+            tracing::debug!("skipping RIB snapshot because no snapshot source is registered");
+            return Ok(None);
+        };
+        if input.routes.is_empty() {
+            tracing::debug!("skipping RIB snapshot because no baseline routes exist");
+            return Ok(None);
+        }
+        Ok(Some(self.snapshot_now(input).await?))
+    }
+
+    /// Reads the registered source, if any, and stamps the archive's own
+    /// ingestion clock on the view.
+    async fn snapshot_input_from_source(&self, now_ts: i64) -> Result<Option<RibSnapshotInput>> {
+        let Some(source) = self.snapshot_source.get() else {
+            return Ok(None);
+        };
+        let mut input = source.snapshot_input().await?;
+        input.timestamp = now_ts;
+        Ok(Some(input))
+    }
+
     pub async fn rollover(&self, stream: ArchiveStream) -> Result<()> {
         if !self.cfg.enabled {
             return Ok(());
@@ -202,19 +293,7 @@ impl ArchiveService {
                 self.rotate_updates(Utc::now().timestamp()).await?;
             }
             ArchiveStream::Ribs => {
-                let now = Utc::now().timestamp();
-                let snapshot = RibSnapshotInput {
-                    timestamp: now,
-                    collector_bgp_id: self.collector_bgp_id,
-                    view_name: "main".to_string(),
-                    peers: vec![],
-                    routes: vec![],
-                };
-                if snapshot.routes.is_empty() {
-                    tracing::debug!("skipping RIB rollover because no baseline routes exist");
-                } else {
-                    self.snapshot_now(snapshot).await?;
-                }
+                self.snapshot_from_source(Utc::now().timestamp()).await?;
             }
         }
 
@@ -287,20 +366,10 @@ impl ArchiveService {
 
         let rib_bucket = aligned_epoch(now, self.cfg.ribs_interval_secs);
         let mut last_rib = self.last_rib_bucket.lock().await;
-        if last_rib.map(|v| v != rib_bucket).unwrap_or(true) {
-            let snapshot = RibSnapshotInput {
-                timestamp: now,
-                collector_bgp_id: self.collector_bgp_id,
-                view_name: "main".to_string(),
-                peers: vec![],
-                routes: vec![],
-            };
-            if snapshot.routes.is_empty() {
-                tracing::debug!("skipping RIB snapshot because no baseline routes exist");
-            } else {
-                self.snapshot_now(snapshot).await?;
-                *last_rib = Some(rib_bucket);
-            }
+        if last_rib.map(|v| v != rib_bucket).unwrap_or(true)
+            && self.snapshot_from_source(now).await?.is_some()
+        {
+            *last_rib = Some(rib_bucket);
         }
 
         Ok(())
@@ -394,12 +463,13 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use anyhow::{Context, Result};
+    use bgpkit_parser::models::{MrtMessage, TableDumpV2Message};
     use bgpkit_parser::parse_mrt_record;
     use chrono::Utc;
     use flate2::read::GzDecoder;
 
     use super::*;
-    use crate::archive::types::UpdateRecordInput;
+    use crate::archive::types::{SnapshotPeer, SnapshotRoute, UpdateRecordInput};
     use crate::config::ArchiveConfig;
 
     #[tokio::test]
@@ -473,6 +543,137 @@ mod tests {
                     && entry.file_name().to_string_lossy().starts_with("rib.")
             }));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn rib_rollover_with_a_snapshot_source_writes_a_rib_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("archive");
+        let cfg = ArchiveConfig {
+            enabled: true,
+            root: root.clone(),
+            tmp_root: root.join(".tmp"),
+            ..ArchiveConfig::default()
+        };
+        let service = ArchiveService::new(cfg, Ipv4Addr::new(192, 0, 2, 1)).await?;
+        service.set_snapshot_source(Arc::new(FakeSnapshotSource {
+            peers: vec![SnapshotPeer {
+                peer_bgp_id: Ipv4Addr::new(198, 51, 100, 1),
+                peer_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                peer_asn: 64_512,
+            }],
+            routes: vec![SnapshotRoute {
+                prefix: "203.0.113.0/24".parse()?,
+                peer_index: 0,
+                originated_time: 1_700_000_000,
+                path_id: None,
+                path_attributes: vec![],
+            }],
+        }));
+
+        service.rollover(ArchiveStream::Ribs).await?;
+
+        let status = service.status().await?;
+        let path = status
+            .ribs_last_path
+            .clone()
+            .context("a rollover with routes should finalize a RIB segment")?;
+        assert_eq!(status.ribs_last_record_count, 2);
+        let mut decoded = Vec::new();
+        GzDecoder::new(File::open(&path)?).read_to_end(&mut decoded)?;
+        let mut cursor = Cursor::new(decoded);
+        let peer_index = parse_mrt_record(&mut cursor)?;
+        let rib = parse_mrt_record(&mut cursor)?;
+        assert!(matches!(
+            peer_index.message,
+            MrtMessage::TableDumpV2Message(TableDumpV2Message::PeerIndexTable(_))
+        ));
+        assert!(matches!(
+            rib.message,
+            MrtMessage::TableDumpV2Message(TableDumpV2Message::RibAfi(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tick_with_a_source_but_no_routes_writes_no_rib_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("archive");
+        let cfg = ArchiveConfig {
+            enabled: true,
+            root: root.clone(),
+            tmp_root: root.join(".tmp"),
+            ..ArchiveConfig::default()
+        };
+        let service = ArchiveService::new(cfg, Ipv4Addr::new(192, 0, 2, 1)).await?;
+        service.set_snapshot_source(Arc::new(FakeSnapshotSource {
+            peers: vec![SnapshotPeer {
+                peer_bgp_id: Ipv4Addr::new(198, 51, 100, 1),
+                peer_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                peer_asn: 64_512,
+            }],
+            routes: vec![],
+        }));
+
+        service.tick().await?;
+
+        let status = service.status().await?;
+        assert!(
+            status.ribs_last_path.is_none(),
+            "a view without routes must not write a RIB file"
+        );
+        assert!(!walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_type().is_file()
+                    && entry.file_name().to_string_lossy().starts_with("rib.")
+            }));
+        Ok(())
+    }
+
+    /// An explicit `archive snapshot-now` request is served from the same
+    /// source but, unlike the scheduled snapshot, still writes a segment.
+    #[tokio::test]
+    async fn explicit_snapshot_writes_a_segment_without_routes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("archive");
+        let cfg = ArchiveConfig {
+            enabled: true,
+            root: root.clone(),
+            tmp_root: root.join(".tmp"),
+            ..ArchiveConfig::default()
+        };
+        let service = ArchiveService::new(cfg, Ipv4Addr::new(192, 0, 2, 1)).await?;
+        service.set_snapshot_source(Arc::new(FakeSnapshotSource {
+            peers: vec![],
+            routes: vec![],
+        }));
+
+        let finalized = service.snapshot_current().await?;
+        assert!(finalized.final_path.exists());
+        assert_eq!(finalized.record_count, 1);
+        Ok(())
+    }
+
+    /// Stands in for the speaker: the archive only sees the source port.
+    struct FakeSnapshotSource {
+        peers: Vec<SnapshotPeer>,
+        routes: Vec<SnapshotRoute>,
+    }
+
+    impl RibSnapshotSource for FakeSnapshotSource {
+        fn snapshot_input(&self) -> SnapshotInputFuture<'_> {
+            Box::pin(async move {
+                Ok(RibSnapshotInput {
+                    timestamp: 0,
+                    collector_bgp_id: Ipv4Addr::UNSPECIFIED,
+                    view_name: "main".to_string(),
+                    peers: self.peers.clone(),
+                    routes: self.routes.clone(),
+                })
+            })
+        }
     }
 
     fn test_update(timestamp: i64) -> UpdateRecordInput {

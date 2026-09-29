@@ -8,9 +8,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use bgpkit_parser::bgp::parse_bgp_message;
 use bgpkit_parser::models::{
-    Afi, AsPath, Asn, AsnLength, AttrFlags, Attribute, AttributeValue, Attributes, BgpMessage,
-    BgpOpenMessage, BgpRouteRefreshMessage, BgpUpdateMessage, NetworkPrefix, Nlri, OptParam,
-    Origin, ParamValue, Safi,
+    Afi, AsPath, Asn, AsnLength, AttrFlags, AttrType, Attribute, AttributeValue, Attributes,
+    BgpMessage, BgpOpenMessage, BgpRouteRefreshMessage, BgpUpdateMessage, NetworkPrefix, Nlri,
+    OptParam, Origin, ParamValue, Safi,
 };
 use bytes::Bytes;
 use ipnet::IpNet;
@@ -22,8 +22,10 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
 
-use crate::archive::types::{PeerStateRecordInput, UpdateRecordInput};
-use crate::archive::ArchiveService;
+use crate::archive::types::{
+    PeerStateRecordInput, RibSnapshotInput, SnapshotPeer, SnapshotRoute, UpdateRecordInput,
+};
+use crate::archive::{ArchiveService, RibSnapshotSource, SnapshotInputFuture};
 use crate::config::{FoclConfig, PeerConfig};
 use crate::types::{Event, EventEnvelope, PeerState};
 
@@ -62,6 +64,10 @@ struct PeerRuntime {
     info: PeerInfo,
     cfg: PeerConfig,
     task: Option<JoinHandle<()>>,
+    /// The peer's BGP identifier, learned from its OPEN. A TABLE_DUMP_V2
+    /// snapshot Peer entry carries it; it is unspecified until a session has
+    /// presented an OPEN.
+    remote_bgp_id: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone)]
@@ -422,7 +428,11 @@ fn ensure_next_hop_family(network: &IpNet, next_hop: IpAddr) -> Result<()> {
 #[derive(Debug, Clone)]
 struct AdjRibValue {
     next_hop: Option<IpAddr>,
-    as_path: Option<String>,
+    /// The received AS path, kept parsed rather than formatted: a RIB snapshot
+    /// rebuilds the route's AS_PATH attribute from it.
+    as_path: Option<AsPath>,
+    /// The received ORIGIN, when the peer sent one.
+    origin: Option<Origin>,
     last_seen: i64,
 }
 
@@ -568,6 +578,7 @@ impl BgpService {
             info,
             cfg: peer_cfg,
             task,
+            remote_bgp_id: None,
         }
     }
 
@@ -680,7 +691,9 @@ impl BgpService {
         let key = peer.address.clone();
         let task = tokio::spawn(async move {
             let result = service.run_session(&peer, stream).await;
-            service.clear_rib(&peer.address).await;
+            // Record the exit transition before clearing the RIB: `clear_rib`
+            // drops the session's local address, and a state change without it
+            // cannot be archived.
             match result {
                 Ok(()) => {
                     service
@@ -698,6 +711,7 @@ impl BgpService {
                         .await
                 }
             }
+            service.clear_rib(&peer.address).await;
             if !peer.passive {
                 sleep(Duration::from_secs(peer.connect_retry_secs as u64)).await;
                 service.peer_loop(peer).await;
@@ -714,7 +728,8 @@ impl BgpService {
             self.set_peer_state(&peer.address, PeerState::Connect, None, None)
                 .await;
             let result = self.run_active_session(&peer).await;
-            self.clear_rib(&peer.address).await;
+            // Same ordering as the passive path: archive the exit transition
+            // while the session's local address is still known.
             match result {
                 Ok(()) => {
                     self.set_peer_state(&peer.address, PeerState::Active, None, None)
@@ -730,6 +745,7 @@ impl BgpService {
                     .await;
                 }
             }
+            self.clear_rib(&peer.address).await;
             sleep(Duration::from_secs(peer.connect_retry_secs as u64)).await;
         }
     }
@@ -808,6 +824,9 @@ impl BgpService {
         // RFC 4271 s4.4/s6.1: the hold time that governs this session is 0 when
         // either side advertised 0, otherwise the smaller of the two.
         let hold_time = negotiate_hold_time(peer.hold_time_secs, remote_open.hold_time);
+        if let Some(runtime) = self.inner.peers.write().await.get_mut(&peer.address) {
+            runtime.remote_bgp_id = Some(remote_open.bgp_identifier);
+        }
 
         self.set_peer_state(&peer.address, PeerState::OpenConfirm, None, None)
             .await;
@@ -1041,7 +1060,9 @@ impl BgpService {
 
     /// Writes updates to one session and mirrors them into the archive. The
     /// archive is receive-only for a collector, so our own announcements are
-    /// recorded here to keep a self-contained lab archive complete.
+    /// recorded here to keep a self-contained lab archive complete; they are
+    /// archived in the local direction (RFC 6396 section 4.4.6), so a consumer
+    /// can still tell them apart from updates received from the peer.
     async fn emit_updates<W: AsyncWrite + Unpin>(
         &self,
         peer: &PeerConfig,
@@ -1056,7 +1077,7 @@ impl BgpService {
             let raw = write_bgp_message(writer, &update, asn_len).await?;
             if let Some(archive) = &self.inner.archive {
                 archive
-                    .ingest_update(UpdateRecordInput {
+                    .ingest_local_update(UpdateRecordInput {
                         timestamp: chrono::Utc::now().timestamp(),
                         peer_ip: peer.address.parse().context("invalid configured peer IP")?,
                         peer_asn: peer.remote_as,
@@ -1105,7 +1126,13 @@ impl BgpService {
         negotiated: &NegotiatedCapabilities,
     ) {
         let next_hop = update.attributes.next_hop();
-        let as_path = update.attributes.as_path().map(ToString::to_string);
+        let as_path = update.attributes.as_path().cloned();
+        // Absent ORIGIN stays absent: the snapshot must not invent a value for
+        // an attribute the peer never sent.
+        let origin = update
+            .attributes
+            .has_attr(AttrType::ORIGIN)
+            .then(|| update.attributes.origin());
         let now = chrono::Utc::now().timestamp();
         let mut ribs = self.inner.rib_in.write().await;
         let rib = ribs.entry(peer.to_string()).or_insert_with(IpnetTrie::new);
@@ -1124,6 +1151,7 @@ impl BgpService {
                     AdjRibValue {
                         next_hop,
                         as_path: as_path.clone(),
+                        origin,
                         last_seen: now,
                     },
                 );
@@ -1145,6 +1173,7 @@ impl BgpService {
                         AdjRibValue {
                             next_hop: mp_next_hop,
                             as_path: as_path.clone(),
+                            origin,
                             last_seen: now,
                         },
                     );
@@ -1520,6 +1549,94 @@ impl BgpService {
         prefixes.sort();
         Ok(prefixes)
     }
+
+    /// Builds the archive's RIB view: every peer that currently holds a
+    /// session, with its Adj-RIB-In entries. The trie the session loop already
+    /// maintains is the source; an Adj-RIB-In value keeps no attribute blob
+    /// (interning is deferred), so a route's TABLE_DUMP_V2 attributes are
+    /// rebuilt from ORIGIN, the stored AS path and, for IPv4 prefixes, the
+    /// next hop.
+    pub async fn rib_snapshot_input(&self) -> Result<RibSnapshotInput> {
+        let local_ips = self.inner.session_local_ips.read().await;
+        let peers = self.inner.peers.read().await;
+        let ribs = self.inner.rib_in.read().await;
+
+        // A stable order keeps the peer index table reproducible.
+        let mut addresses = local_ips.keys().cloned().collect::<Vec<_>>();
+        addresses.sort();
+
+        let mut snapshot_peers = Vec::with_capacity(addresses.len());
+        let mut routes = Vec::new();
+        for address in addresses {
+            let Some(runtime) = peers.get(&address) else {
+                continue;
+            };
+            let Ok(peer_ip) = address.parse::<IpAddr>() else {
+                continue;
+            };
+            let peer_index = u16::try_from(snapshot_peers.len())
+                .context("snapshot peer count exceeds the TABLE_DUMP_V2 limit")?;
+            snapshot_peers.push(SnapshotPeer {
+                peer_bgp_id: runtime.remote_bgp_id.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                peer_ip,
+                peer_asn: runtime.info.remote_as,
+            });
+            let Some(rib) = ribs.get(&address) else {
+                continue;
+            };
+            for (prefix, value) in rib.iter() {
+                routes.push(SnapshotRoute {
+                    prefix,
+                    peer_index,
+                    originated_time: value.last_seen as u32,
+                    path_id: None,
+                    path_attributes: snapshot_path_attributes(value, prefix)?,
+                });
+            }
+        }
+
+        Ok(RibSnapshotInput {
+            timestamp: chrono::Utc::now().timestamp(),
+            collector_bgp_id: Ipv4Addr::UNSPECIFIED,
+            view_name: "main".to_string(),
+            peers: snapshot_peers,
+            routes,
+        })
+    }
+}
+
+impl RibSnapshotSource for BgpService {
+    fn snapshot_input(&self) -> SnapshotInputFuture<'_> {
+        Box::pin(self.rib_snapshot_input())
+    }
+}
+
+/// Rebuilds the path attributes a TABLE_DUMP_V2 RIB entry carries from one
+/// Adj-RIB-In value: the received ORIGIN and AS path (attribute type 2 with
+/// four-octet segments), plus NEXT_HOP for an IPv4 prefix. A table dump has no
+/// NLRI inside the attribute blob, so no MP_REACH is emitted for IPv6, and an
+/// attribute the peer never sent is left out rather than invented.
+fn snapshot_path_attributes(value: &AdjRibValue, prefix: IpNet) -> Result<Vec<u8>> {
+    let mut attributes = Attributes::default();
+    if let Some(origin) = value.origin {
+        attributes.add_attr(AttributeValue::Origin(origin).into());
+    }
+    if let Some(as_path) = &value.as_path {
+        attributes.add_attr(
+            AttributeValue::AsPath {
+                path: as_path.clone(),
+                is_as4: false,
+            }
+            .into(),
+        );
+    }
+    if let (Some(next_hop @ IpAddr::V4(_)), IpNet::V4(_)) = (value.next_hop, prefix) {
+        attributes.add_attr(AttributeValue::NextHop(next_hop).into());
+    }
+    let encoded = attributes
+        .encode(AsnLength::Bits32)
+        .map_err(|error| anyhow!("failed encoding snapshot path attributes: {error}"))?;
+    Ok(encoded.to_vec())
 }
 
 /// RFC 4271 s4.2/s6.1 hold-time negotiation: a hold time of 0 on either side

@@ -37,6 +37,12 @@ All notable changes to this project will be documented in this file.
 * Archive writers rotate on the ingestion clock only, so a record with a late or zero event timestamp stays in the current segment with its event time preserved in the MRT header, and a rollover with no routes no longer writes an empty RIB snapshot.
 * The archive collector id and custom path templates are validated at config load: the id must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, templates reject absolute, backslash, control-character, empty and `..` components, and the rendered path is asserted to stay inside the archive root.
 
+### Bug fixes
+
+* **RIB snapshots carry the live Adj-RIB-In.** The archive asks the speaker for its current view through a small source port that `focld` registers after both services exist, so `rib.*` segments are produced again on the configured interval: one peer index table entry per peer holding a session (with the BGP identifier from its OPEN) and one `TABLE_DUMP_V2` RIB entry per Adj-RIB-In route, with path attributes rebuilt from ORIGIN, the received AS path and the IPv4 next hop. A view without routes still writes no file, and `archive snapshot-now` serves the same view while writing a segment on the explicit request.
+* **An inbound session's exit from Established is archived.** The state transition is recorded before the RIB (and the session's local address with it) is cleared, in both the active and the passive session path, so the `Established -> Active` record is no longer dropped.
+* **Locally generated messages use the local BGP4MP subtype.** Our own announcements are archived as `BGP4MP_MESSAGE_AS4_LOCAL` (subtype 7) instead of `BGP4MP_MESSAGE_AS4`, so a consumer does not read them as updates received from the peer. Both directions stay archived; the received path is unchanged.
+
 ## v0.1.0 - 2025-02-21
 
 ### New features
