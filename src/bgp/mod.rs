@@ -257,7 +257,15 @@ impl PrefixState {
         let mut rows: Vec<PrefixView> = self
             .config
             .iter()
-            .map(|entry| self.view_of(entry, PrefixSource::Config))
+            .map(|entry| {
+                // A runtime entry shadows the configured one for the same
+                // network, so the row has to describe the entry that is
+                // actually announced, not the config baseline behind it.
+                match self.added.get(&entry.network) {
+                    Some(runtime) => self.view_of(runtime, PrefixSource::Runtime),
+                    None => self.view_of(entry, PrefixSource::Config),
+                }
+            })
             .collect();
         for (network, entry) in &self.added {
             if self.config.iter().any(|e| e.network == *network) {
@@ -308,9 +316,11 @@ impl PrefixState {
     /// suppressed. Returns whether the effective originated set changed.
     fn remove(&mut self, network: &IpNet) -> bool {
         let was_announced = self.is_announced(network);
-        if self.added.remove(network).is_some() {
-            return was_announced;
-        }
+        // Dropping a runtime override alone leaves a configured network
+        // announced through the config baseline, so a configured network has to
+        // be suppressed as well; otherwise peers get a withdrawal while the
+        // state still calls the network announced.
+        self.added.remove(network);
         if self.config.iter().any(|e| e.network == *network) {
             self.suppressed.insert(*network);
         }
@@ -319,6 +329,12 @@ impl PrefixState {
 
     /// Replaces the config baseline and drops every runtime override, returning
     /// the prefixes to announce and to withdraw.
+    ///
+    /// The delta compares whole entries, not just networks: a changed configured
+    /// next hop or a changed/cleared attribute-255 interval updates the internal
+    /// state but leaves established peers with the old attributes on the wire, so
+    /// it counts as an announcement. A changed interval only takes effect after
+    /// a restart, because the refresh task set is sampled at startup.
     fn reset_overrides(&mut self, config: Vec<PrefixEntry>) -> (Vec<PrefixEntry>, Vec<IpNet>) {
         let before = self.effective();
         self.config = config;
@@ -327,7 +343,13 @@ impl PrefixState {
         let after = self.effective();
         let announce = after
             .iter()
-            .filter(|entry| !before.iter().any(|old| old.network == entry.network))
+            .filter(|entry| {
+                !before.iter().any(|old| {
+                    old.network == entry.network
+                        && old.next_hop == entry.next_hop
+                        && old.dev_attr255_interval_secs == entry.dev_attr255_interval_secs
+                })
+            })
             .cloned()
             .collect();
         let withdraw = before
@@ -360,6 +382,18 @@ fn parse_prefix_entries(cfg: &FoclConfig) -> Result<Vec<PrefixEntry>> {
                 .map(|nh| nh.parse::<IpAddr>())
                 .transpose()
                 .with_context(|| format!("invalid next-hop address: {:?}", p.next_hop))?;
+            if let Some(next_hop) = next_hop {
+                // Same check as the runtime path: classic NEXT_HOP only carries
+                // the prefix's own family, so a mismatched configured next hop
+                // would encode a 16-octet v6 NEXT_HOP on a v4 announcement (the
+                // inverse is dropped later), never reaching the wire as intended.
+                ensure_next_hop_family(&network, next_hop).with_context(|| {
+                    format!(
+                        "invalid prefix entry {} with next hop {next_hop}",
+                        p.network
+                    )
+                })?;
+            }
             Ok::<_, anyhow::Error>(PrefixEntry {
                 network,
                 next_hop,
@@ -1295,9 +1329,12 @@ impl BgpService {
                 dev_attr255_interval_secs: state.configured_attr255_interval(&network),
             }
         };
-        // A dry run reports what would happen without touching the state.
+        // A dry run reports what would happen without touching the state: run
+        // the same `add` on a snapshot clone and discard it, so a dry run and
+        // the real mutation agree (including a next-hop change).
         let changed = if dry_run {
-            !self.inner.prefix_state.read().await.is_announced(&network)
+            let mut snapshot = self.inner.prefix_state.read().await.clone();
+            snapshot.add(entry.clone())
         } else {
             self.inner.prefix_state.write().await.add(entry.clone())
         };
@@ -1324,9 +1361,12 @@ impl BgpService {
     /// Withdraws a prefix at runtime: a configured prefix is suppressed, a
     /// runtime-only one is dropped.
     pub async fn prefix_remove(&self, network: IpNet, dry_run: bool) -> Result<PrefixMutation> {
-        // Provenance has to be read before the entry is dropped.
-        let previous_source = self.inner.prefix_state.read().await.source_of(&network);
         let _guard = self.inner.prefix_ops.lock().await;
+        // Provenance has to be read before the entry is dropped, and under the
+        // mutation lock: a concurrent add/remove/reload can change (or drop) it
+        // in between, and the reported source would not describe the entry the
+        // withdrawal applies to.
+        let previous_source = self.inner.prefix_state.read().await.source_of(&network);
         let changed = if dry_run {
             self.inner.prefix_state.read().await.is_announced(&network)
         } else {
@@ -2295,6 +2335,40 @@ mod tests {
     }
 
     #[test]
+    fn reload_re_announces_changed_attributes_and_withdraws_gone_networks() {
+        let network: IpNet = "192.0.2.0/24".parse().unwrap();
+        let entry = |next_hop: &str, interval: Option<u32>| PrefixEntry {
+            network,
+            next_hop: Some(next_hop.parse().unwrap()),
+            dev_attr255_interval_secs: interval,
+        };
+        let mut state = PrefixState::new(vec![entry("10.0.0.1", Some(1800))]);
+
+        // An unchanged config produces an empty delta.
+        let (announce, withdraw) = state.reset_overrides(vec![entry("10.0.0.1", Some(1800))]);
+        assert!(announce.is_empty(), "unchanged config must not re-announce");
+        assert!(withdraw.is_empty());
+
+        // A new configured next hop only reaches the wire on a re-announcement.
+        let (announce, withdraw) = state.reset_overrides(vec![entry("10.0.0.9", Some(1800))]);
+        assert_eq!(announce.len(), 1);
+        assert_eq!(announce[0].next_hop, Some("10.0.0.9".parse().unwrap()));
+        assert!(announce[0].dev_attr255_interval_secs == Some(1800));
+        assert!(withdraw.is_empty());
+
+        // Clearing the attribute-255 clock changes the wire attributes too.
+        let (announce, withdraw) = state.reset_overrides(vec![entry("10.0.0.9", None)]);
+        assert_eq!(announce.len(), 1);
+        assert_eq!(announce[0].dev_attr255_interval_secs, None);
+        assert!(withdraw.is_empty());
+
+        // A network that disappeared stays a withdrawal, not an announcement.
+        let (announce, withdraw) = state.reset_overrides(vec![]);
+        assert!(announce.is_empty());
+        assert_eq!(withdraw, vec![network]);
+    }
+
+    #[test]
     fn withdraw_updates_use_withdrawn_nlri_for_v4_and_mp_unreach_for_v6() {
         let networks: Vec<IpNet> = vec![
             "192.0.2.0/24".parse().unwrap(),
@@ -2357,6 +2431,54 @@ mod tests {
     }
 
     #[test]
+    fn configured_next_hop_must_match_the_prefix_family() {
+        use crate::config::PrefixConfig;
+
+        fn entry_config(network: &str, next_hop: &str) -> FoclConfig {
+            let mut cfg = test_service_config();
+            cfg.prefixes = vec![PrefixConfig {
+                network: network.to_string(),
+                next_hop: Some(next_hop.to_string()),
+                dev_attr255_interval_secs: None,
+            }];
+            cfg
+        }
+
+        // A v6 next hop on a v4 prefix would reach classic NEXT_HOP encoding.
+        let error = parse_prefix_entries(&entry_config("192.0.2.0/24", "2001:db8::1"))
+            .expect_err("a v6 next hop on a v4 prefix must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("192.0.2.0/24") && message.contains("2001:db8::1"),
+            "the error names the entry: {message}"
+        );
+        assert!(
+            message.contains("does not match the prefix family"),
+            "{message}"
+        );
+
+        // The inverse: a v4 next hop on a v6 prefix is dropped later, so it is
+        // rejected at parse time too.
+        let error = parse_prefix_entries(&entry_config("2001:db8::/48", "192.0.2.1"))
+            .expect_err("a v4 next hop on a v6 prefix must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("2001:db8::/48") && message.contains("192.0.2.1"),
+            "the error names the entry: {message}"
+        );
+
+        // Matching pairs still parse.
+        let entries = parse_prefix_entries(&entry_config("192.0.2.0/24", "192.0.2.1"))
+            .expect("a matching v4 pair must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].next_hop, Some("192.0.2.1".parse().unwrap()));
+        let entries = parse_prefix_entries(&entry_config("2001:db8::/48", "2001:db8::1"))
+            .expect("a matching v6 pair must parse");
+        assert_eq!(entries[0].network.to_string(), "2001:db8::/48");
+        assert_eq!(entries[0].next_hop, Some("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
     fn next_hop_change_is_a_change() {
         let network: IpNet = "198.51.100.0/24".parse().unwrap();
         let first: IpAddr = "192.0.2.1".parse().unwrap();
@@ -2413,6 +2535,69 @@ mod tests {
             "the config entry must not be duplicated"
         );
         assert_eq!(effective[0].next_hop, Some(override_hop));
+    }
+
+    #[test]
+    fn remove_after_a_next_hop_override_suppresses_the_configured_prefix() {
+        let network: IpNet = "192.0.2.0/24".parse().unwrap();
+        let mut state = PrefixState::new(vec![PrefixEntry {
+            network,
+            next_hop: Some("10.0.0.1".parse().unwrap()),
+            dev_attr255_interval_secs: None,
+        }]);
+
+        // A runtime override on a configured network.
+        assert!(state.add(PrefixEntry {
+            network,
+            next_hop: Some("10.0.0.9".parse().unwrap()),
+            dev_attr255_interval_secs: None,
+        }));
+
+        // Removing it must suppress the config baseline as well: dropping only
+        // the override leaves the network announced through the config entry.
+        assert!(state.remove(&network));
+        assert!(
+            state
+                .effective()
+                .iter()
+                .all(|entry| entry.network != network),
+            "the config baseline must not stay in the effective set"
+        );
+        assert_eq!(state.status_of(&network), PrefixStatus::Suppressed);
+        assert_eq!(state.source_of(&network), Some(PrefixSource::Config));
+        // Removing it again changes nothing.
+        assert!(!state.remove(&network));
+        assert_eq!(state.override_count(), 1);
+    }
+
+    #[test]
+    fn prefix_list_reports_the_runtime_override_for_a_configured_network() {
+        let network: IpNet = "192.0.2.0/24".parse().unwrap();
+        let mut state = PrefixState::new(vec![PrefixEntry {
+            network,
+            next_hop: Some("10.0.0.1".parse().unwrap()),
+            dev_attr255_interval_secs: None,
+        }]);
+        assert!(state.add(PrefixEntry {
+            network,
+            next_hop: Some("10.0.0.9".parse().unwrap()),
+            dev_attr255_interval_secs: None,
+        }));
+
+        let rows = state.view();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the override must not add a second row for the same network"
+        );
+        assert_eq!(rows[0].network, network.to_string());
+        assert_eq!(
+            rows[0].next_hop.as_deref(),
+            Some("10.0.0.9"),
+            "the row must describe the entry that is announced"
+        );
+        assert_eq!(rows[0].source, PrefixSource::Runtime);
+        assert_eq!(rows[0].status, PrefixStatus::Announced);
     }
 
     #[test]
@@ -2677,5 +2862,90 @@ enabled = false
             .to_string()
             .contains("does not match the prefix family"));
         assert!(service.prefix_view().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dry_run_add_reports_a_next_hop_change_and_family_targets() {
+        use crate::config::PrefixConfig;
+
+        let network: IpNet = "192.0.2.0/24".parse().unwrap();
+        let configured: IpAddr = "192.0.2.1".parse().unwrap();
+        let override_hop: IpAddr = "192.0.2.9".parse().unwrap();
+        let mut cfg = test_service_config();
+        cfg.prefixes.push(PrefixConfig {
+            network: network.to_string(),
+            next_hop: Some(configured.to_string()),
+            dev_attr255_interval_secs: None,
+        });
+        let (event_tx, _) = broadcast::channel::<EventEnvelope>(4);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+
+        // One dual-stack session and one IPv6-only session: only the peers that
+        // can carry the network's family may be named as targets.
+        for (peer, supports_v4, supports_v6) in
+            [("192.0.2.2", true, true), ("2001:db8::2", false, true)]
+        {
+            let (tx, _rx) = mpsc::channel(4);
+            service.inner.session_ops.write().await.insert(
+                peer.to_string(),
+                SessionHandle {
+                    tx,
+                    supports_v4,
+                    supports_v6,
+                },
+            );
+        }
+
+        let dry = service
+            .prefix_add(network, Some(override_hop), true)
+            .await
+            .unwrap();
+        assert!(
+            dry.changed,
+            "a next-hop change is a change in a dry run too"
+        );
+        assert!(dry.dry_run);
+        assert_eq!(dry.peers_notified, vec!["192.0.2.2".to_string()]);
+        assert_eq!(dry.status, PrefixStatus::Announced);
+
+        // A new v6 network reaches both sessions.
+        let v6: IpNet = "2001:db8:1::/48".parse().unwrap();
+        let dry_v6 = service.prefix_add(v6, None, true).await.unwrap();
+        assert!(dry_v6.changed);
+        assert_eq!(
+            dry_v6.peers_notified,
+            vec!["192.0.2.2".to_string(), "2001:db8::2".to_string()]
+        );
+
+        // The dry runs must not have touched the state.
+        let rows = service.prefix_view().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].next_hop.as_deref(), Some("192.0.2.1"));
+        let effective = service.inner.prefix_state.read().await.effective();
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].next_hop, Some(configured));
+    }
+
+    #[tokio::test]
+    async fn prefix_remove_reads_provenance_under_the_mutation_lock() {
+        let cfg = test_service_config();
+        let (event_tx, _) = broadcast::channel::<EventEnvelope>(4);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+        let network: IpNet = "198.51.100.0/24".parse().unwrap();
+
+        let added = service.prefix_add(network, None, false).await.unwrap();
+        assert_eq!(added.source, Some(PrefixSource::Runtime));
+
+        // The source has to be read before the entry is dropped, while holding
+        // `prefix_ops`, so no concurrent mutation can change it in between.
+        let removed = service.prefix_remove(network, false).await.unwrap();
+        assert!(removed.changed);
+        assert_eq!(removed.source, Some(PrefixSource::Runtime));
+        assert_eq!(removed.status, PrefixStatus::Absent);
+
+        // A network the state never knew reports null, from the same locked read.
+        let again = service.prefix_remove(network, false).await.unwrap();
+        assert!(!again.changed);
+        assert_eq!(again.source, None);
     }
 }
