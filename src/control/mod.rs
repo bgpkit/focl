@@ -15,6 +15,9 @@ pub enum CommandKind {
     RibSummary,
     RibIn,
     RibOut,
+    PrefixAdd,
+    PrefixRemove,
+    PrefixList,
     ArchiveStatus,
     ArchiveRollover,
     ArchiveSnapshotNow,
@@ -36,6 +39,9 @@ impl CommandKind {
             "rib_summary" => Self::RibSummary,
             "rib_in" => Self::RibIn,
             "rib_out" => Self::RibOut,
+            "prefix_add" => Self::PrefixAdd,
+            "prefix_remove" => Self::PrefixRemove,
+            "prefix_list" => Self::PrefixList,
             "archive_status" => Self::ArchiveStatus,
             "archive_rollover" => Self::ArchiveRollover,
             "archive_snapshot_now" => Self::ArchiveSnapshotNow,
@@ -52,6 +58,22 @@ pub struct PeerKeyArgs {
 }
 
 impl PeerKeyArgs {
+    pub fn from_json(value: &Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
+    }
+}
+
+/// Arguments for `prefix_add` / `prefix_remove`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefixMutationArgs {
+    pub network: String,
+    #[serde(default)]
+    pub next_hop: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl PrefixMutationArgs {
     pub fn from_json(value: &Value) -> Result<Self, serde_json::Error> {
         serde_json::from_value(value.clone())
     }
@@ -111,5 +133,35 @@ pub struct ArchiveDestinationsResult {
 impl ArchiveDestinationsResult {
     pub fn as_value(&self) -> Value {
         json!(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_commands_are_recognized() {
+        for (cmd, expected) in [
+            ("prefix_add", CommandKind::PrefixAdd),
+            ("prefix_remove", CommandKind::PrefixRemove),
+            ("prefix_list", CommandKind::PrefixList),
+        ] {
+            let request = ControlRequest {
+                version: 1,
+                id: "test".to_string(),
+                cmd: cmd.to_string(),
+                args: json!({}),
+            };
+            assert_eq!(CommandKind::from_request(&request), expected);
+        }
+    }
+
+    #[test]
+    fn prefix_mutation_args_default_next_hop_and_dry_run() {
+        let args = PrefixMutationArgs::from_json(&json!({"network": "192.0.2.0/24"})).unwrap();
+        assert_eq!(args.network, "192.0.2.0/24");
+        assert!(args.next_hop.is_none());
+        assert!(!args.dry_run);
     }
 }

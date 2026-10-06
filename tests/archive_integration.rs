@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use focl::archive::types::UpdateRecordInput;
 use focl::archive::ArchiveService;
@@ -49,8 +49,8 @@ async fn writes_updates_segment_and_manifest_on_rollover() {
             peer_asn: 64512,
             local_asn: 64513,
             interface_index: 0,
-            peer_ip: Ipv4Addr::new(198, 51, 100, 1),
-            local_ip: Ipv4Addr::new(198, 51, 100, 2),
+            peer_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            local_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
             bgp_message: valid_update_withdraw_message(),
         })
         .await
