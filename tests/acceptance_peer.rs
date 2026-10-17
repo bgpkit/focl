@@ -1029,13 +1029,7 @@ fn ipv6_eor(message: &BgpMessage) -> bool {
 fn attrs() -> Attributes {
     let mut attrs = Attributes::default();
     attrs.add_attr(AttributeValue::Origin(Origin::IGP).into());
-    attrs.add_attr(
-        AttributeValue::AsPath {
-            path: AsPath::from_sequence([PEER_AS]),
-            is_as4: true,
-        }
-        .into(),
-    );
+    attrs.add_attr(AttributeValue::As4Path(AsPath::from_sequence([PEER_AS])).into());
     attrs
 }
 

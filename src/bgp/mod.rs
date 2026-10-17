@@ -1127,7 +1127,8 @@ impl BgpService {
         negotiated: &NegotiatedCapabilities,
     ) {
         let next_hop = update.attributes.next_hop();
-        let as_path = update.attributes.as_path().cloned();
+        // RFC 6793 §4.2.3 merged path: AS_PATH plus AS4_PATH on migration sessions.
+        let as_path = update.attributes.effective_as_path();
         // Absent ORIGIN stays absent: the snapshot must not invent a value for
         // an attribute the peer never sent.
         let origin = update
@@ -1623,13 +1624,7 @@ fn snapshot_path_attributes(value: &AdjRibValue, prefix: IpNet) -> Result<Vec<u8
         attributes.add_attr(AttributeValue::Origin(origin).into());
     }
     if let Some(as_path) = &value.as_path {
-        attributes.add_attr(
-            AttributeValue::AsPath {
-                path: as_path.clone(),
-                is_as4: false,
-            }
-            .into(),
-        );
+        attributes.add_attr(AttributeValue::AsPath(as_path.clone()).into());
     }
     if let (Some(next_hop @ IpAddr::V4(_)), IpNet::V4(_)) = (value.next_hop, prefix) {
         attributes.add_attr(AttributeValue::NextHop(next_hop).into());
@@ -1911,34 +1906,21 @@ fn build_withdraw_updates(
 fn base_announce_attributes(local_as: u32, negotiated: &NegotiatedCapabilities) -> Attributes {
     let mut attrs = Attributes::default();
     attrs.add_attr(AttributeValue::Origin(Origin::IGP).into());
-    // `is_as4: true` selects AS4_PATH (attribute type 17) and the encoder
-    // always writes it with 4-octet segments. On a session that negotiated
-    // 4-octet AS support the correct wire form is AS_PATH (type 2) with
-    // 4-octet segments, so `is_as4` stays false and the session AsnLength
-    // drives the width. A session without that capability cannot carry a
-    // 4-octet ASN in AS_PATH (RFC 6793 s4.2), so an unrepresentable local ASN
-    // goes into AS4_PATH while AS_TRANS takes its place in AS_PATH; a 2-octet
-    // local ASN needs neither and keeps a plain AS_PATH.
+    // `As4Path` is attribute type 17 and always encodes 4-octet segments. On a
+    // session that negotiated 4-octet AS support the correct wire form is
+    // AS_PATH (type 2) with 4-octet segments, so the session AsnLength drives
+    // the width. A session without that capability cannot carry a 4-octet ASN
+    // in AS_PATH (RFC 6793 s4.2), so an unrepresentable local ASN goes into
+    // AS4_PATH while AS_TRANS takes its place in AS_PATH; a 2-octet local ASN
+    // needs neither and keeps a plain AS_PATH.
     let (as_path, real_asn) = if !negotiated.asn4 && local_as > u32::from(u16::MAX) {
         (u32::from(AS_TRANS), Some(local_as))
     } else {
         (local_as, None)
     };
-    attrs.add_attr(
-        AttributeValue::AsPath {
-            path: AsPath::from_sequence([as_path]),
-            is_as4: false,
-        }
-        .into(),
-    );
+    attrs.add_attr(AttributeValue::AsPath(AsPath::from_sequence([as_path])).into());
     if let Some(real_asn) = real_asn {
-        attrs.add_attr(
-            AttributeValue::AsPath {
-                path: AsPath::from_sequence([real_asn]),
-                is_as4: true,
-            }
-            .into(),
-        );
+        attrs.add_attr(AttributeValue::As4Path(AsPath::from_sequence([real_asn])).into());
     }
     attrs
 }
@@ -2224,7 +2206,8 @@ mod tests {
             .attributes
             .into_attributes_iter()
             .filter_map(|attribute| match attribute.value {
-                AttributeValue::AsPath { path, is_as4 } => Some((is_as4, path.to_string())),
+                AttributeValue::AsPath(path) => Some((false, path.to_string())),
+                AttributeValue::As4Path(path) => Some((true, path.to_string())),
                 _ => None,
             })
             .collect();
