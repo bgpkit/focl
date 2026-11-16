@@ -2060,7 +2060,8 @@ impl std::fmt::Debug for PeerAuth<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PeerAuth::Md5(_) => f.write_str("PeerAuth::Md5(<redacted>)"),
-            PeerAuth::TcpAo(keys) => write!(f, "PeerAuth::TcpAo({} keys, <redacted>)", keys.len()),
+            // `TcpAoKeyConfig` leaves its secret out and shows the KeyIDs.
+            PeerAuth::TcpAo(keys) => f.debug_tuple("PeerAuth::TcpAo").field(keys).finish(),
         }
     }
 }
@@ -2586,6 +2587,7 @@ mod tests {
         assert!(!rendered.contains("md5-secret"), "{rendered}");
         assert!(!rendered.contains("ao-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("send_id: 1, recv_id: 2"), "{rendered}");
     }
 
     #[test]
