@@ -160,8 +160,8 @@ MRT; the archive knows nothing about BMP/BGP sessions.
 ## Phase 2 — BMP station mode
 
 1. **`BmpListener`** on a configurable port per station; per-router
-   TCP-MD5 (TCP-AO is a documentation-level non-goal for v1; focl
-   implements TCP-MD5 only); accept many routers concurrently. Parsing via
+   TCP-MD5 (focl's BGP sessions support TCP-MD5 and TCP-AO; the BMP
+   listener plans MD5 only); accept many routers concurrently. Parsing via
    bgpkit-parser 0.20's BMP module.
 2. **Feed key (from review blocker 1).** Every route-monitoring feed is
    keyed by a canonical `BmpFeedKey`:
@@ -415,8 +415,8 @@ platform other tools can build on.
 3. BMP router identity: one collector_id per router (recommended), resolved
    from trusted `[[bmp.routers]]` config matched by source identity —
    never derived from untrusted BMP Init sysName.
-4. BMP listener MD5: yes (focl implements Linux TCP-MD5 today; TCP-AO is
-   not implemented and stays out of v1 docs).
+4. BMP listener MD5: yes (focl implements Linux TCP-MD5 and, for BGP
+   sessions, TCP-AO; TCP-AO on the BMP listener is not planned).
 5. Trigger delivery semantics: at-least-once with durable per-trigger
    delivery records (pending/running/acknowledged/unknown); exec exit 0 =
    acknowledged; `unknown` retriable. Document clearly, don't pretend

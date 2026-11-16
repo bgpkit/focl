@@ -102,6 +102,12 @@ address = "203.0.113.6"     # neighbor connects to us
 remote_as = 65002
 passive = true
 password = "[REDACTED]"     # optional TCP-MD5
+# or TCP-AO instead of password (Linux 6.7+):
+# [[peers.tcp_ao_keys]]
+# send_id = 1
+# recv_id = 1
+# algorithm = "hmac-sha1-96"  # or "aes-128-cmac-96"
+# secret = "[REDACTED]"
 
 [archive]
 enabled = true

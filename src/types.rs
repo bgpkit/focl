@@ -63,6 +63,18 @@ pub enum PeerState {
     Established,
 }
 
+/// How a peer's TCP connection is authenticated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PeerAuthMode {
+    #[default]
+    None,
+    /// TCP-MD5 (RFC 2385).
+    Md5,
+    /// TCP-AO (RFC 5925).
+    TcpAo,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "payload")]
 pub enum Event {

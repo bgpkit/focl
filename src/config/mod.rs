@@ -61,6 +61,7 @@ impl FoclConfig {
                     );
                 }
             }
+            validate_peer_auth(peer)?;
         }
 
         for prefix in &self.prefixes {
@@ -133,8 +134,99 @@ pub struct PeerConfig {
     pub route_refresh: bool,
     #[serde(default)]
     pub name: Option<String>,
+    /// TCP-MD5 (RFC 2385) password. Mutually exclusive with `tcp_ao_keys`.
     #[serde(default)]
     pub password: Option<String>,
+    /// TCP-AO (RFC 5925) master key tuples. Mutually exclusive with
+    /// `password`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp_ao_keys: Vec<TcpAoKeyConfig>,
+}
+
+/// The longest TCP-MD5 password or TCP-AO secret the Linux kernel accepts.
+pub const TCP_AUTH_MAX_KEY_LEN: usize = 80;
+
+/// One TCP-AO master key tuple (RFC 5925 s3.1). `send_id` goes into the KeyID
+/// of outgoing segments and has to equal the peer's `recv_id`, and vice versa.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpAoKeyConfig {
+    pub send_id: u8,
+    pub recv_id: u8,
+    pub algorithm: TcpAoAlgorithm,
+    pub secret: String,
+    /// Sign outgoing segments with this key and ask the peer to do the same.
+    /// Defaults to the first key when no key sets it.
+    #[serde(default)]
+    pub current: bool,
+}
+
+/// The RFC 5926 MAC algorithms, both with a 96-bit MAC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TcpAoAlgorithm {
+    #[serde(rename = "hmac-sha1-96")]
+    HmacSha1_96,
+    #[serde(rename = "aes-128-cmac-96")]
+    Aes128Cmac96,
+}
+
+fn validate_peer_auth(peer: &PeerConfig) -> Result<()> {
+    if let Some(password) = &peer.password {
+        if password.is_empty() || password.len() > TCP_AUTH_MAX_KEY_LEN {
+            bail!(
+                "peer {} has an invalid password; must be 1-{TCP_AUTH_MAX_KEY_LEN} bytes",
+                peer.address
+            );
+        }
+    }
+    if peer.tcp_ao_keys.is_empty() {
+        return Ok(());
+    }
+    if peer.password.is_some() {
+        bail!(
+            "peer {} sets both password (TCP-MD5) and tcp_ao_keys (TCP-AO); pick one",
+            peer.address
+        );
+    }
+    // The kernel keys TCP-AO by peer address, so a hostname cannot be keyed.
+    if peer.address.parse::<std::net::IpAddr>().is_err() {
+        bail!(
+            "peer {} has tcp_ao_keys and needs a literal IP address",
+            peer.address
+        );
+    }
+    let mut send_ids = std::collections::HashSet::new();
+    let mut recv_ids = std::collections::HashSet::new();
+    for key in &peer.tcp_ao_keys {
+        if key.secret.is_empty() || key.secret.len() > TCP_AUTH_MAX_KEY_LEN {
+            bail!(
+                "peer {} has a TCP-AO key (send_id {}) with an invalid secret; must be 1-{TCP_AUTH_MAX_KEY_LEN} bytes",
+                peer.address,
+                key.send_id
+            );
+        }
+        // RFC 5925 s3.1: a KeyID has to identify a single MKT per direction.
+        if !send_ids.insert(key.send_id) {
+            bail!(
+                "peer {} has duplicate TCP-AO send_id {}",
+                peer.address,
+                key.send_id
+            );
+        }
+        if !recv_ids.insert(key.recv_id) {
+            bail!(
+                "peer {} has duplicate TCP-AO recv_id {}",
+                peer.address,
+                key.recv_id
+            );
+        }
+    }
+    if peer.tcp_ao_keys.iter().filter(|key| key.current).count() > 1 {
+        bail!(
+            "peer {} marks more than one TCP-AO key as current",
+            peer.address
+        );
+    }
+    Ok(())
 }
 
 fn default_true() -> bool {
@@ -629,5 +721,118 @@ dev_attr255_interval_secs = 0
             ribs: "{collector}/{yyyy}/ribs.{yyyymmdd}.{hhmm}.{ext}".to_string(),
         };
         templates.validate().expect("safe template should validate");
+    }
+
+    const TCP_AO_PEER: &str = r#"
+[global]
+asn = 65001
+router_id = "192.0.2.1"
+
+[[peers]]
+address = "192.0.2.2"
+remote_as = 65002
+
+[[peers.tcp_ao_keys]]
+send_id = 1
+recv_id = 2
+algorithm = "hmac-sha1-96"
+secret = "first"
+
+[[peers.tcp_ao_keys]]
+send_id = 3
+recv_id = 4
+algorithm = "aes-128-cmac-96"
+secret = "second"
+current = true
+"#;
+
+    fn tcp_ao_config() -> FoclConfig {
+        toml::from_str(TCP_AO_PEER).expect("toml should parse")
+    }
+
+    fn validation_error(cfg: &FoclConfig) -> String {
+        cfg.validate()
+            .expect_err("config should be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn parses_and_roundtrips_tcp_ao_keys() {
+        let cfg = tcp_ao_config();
+        cfg.validate().expect("TCP-AO peer should validate");
+        let keys = &cfg.peers[0].tcp_ao_keys;
+        assert_eq!(
+            keys[0],
+            TcpAoKeyConfig {
+                send_id: 1,
+                recv_id: 2,
+                algorithm: TcpAoAlgorithm::HmacSha1_96,
+                secret: "first".to_string(),
+                current: false,
+            }
+        );
+        assert_eq!(keys[1].algorithm, TcpAoAlgorithm::Aes128Cmac96);
+        assert!(keys[1].current);
+
+        let encoded = toml::to_string(&cfg).expect("config should serialize");
+        let reparsed: FoclConfig = toml::from_str(&encoded).expect("roundtrip should parse");
+        assert_eq!(reparsed.peers[0].tcp_ao_keys, *keys);
+    }
+
+    #[test]
+    fn rejects_unknown_tcp_ao_algorithm() {
+        let raw = TCP_AO_PEER.replace("aes-128-cmac-96", "hmac-md5");
+        assert!(toml::from_str::<FoclConfig>(&raw).is_err());
+    }
+
+    #[test]
+    fn rejects_password_together_with_tcp_ao_keys() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].password = Some("md5".to_string());
+        assert!(validation_error(&cfg).contains("pick one"));
+    }
+
+    #[test]
+    fn rejects_tcp_ao_keys_on_a_hostname_peer() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].address = "router.example".to_string();
+        assert!(validation_error(&cfg).contains("literal IP address"));
+    }
+
+    #[test]
+    fn rejects_duplicate_tcp_ao_key_ids() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys[1].send_id = 1;
+        assert!(validation_error(&cfg).contains("duplicate TCP-AO send_id 1"));
+
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys[1].recv_id = 2;
+        assert!(validation_error(&cfg).contains("duplicate TCP-AO recv_id 2"));
+    }
+
+    #[test]
+    fn rejects_more_than_one_current_tcp_ao_key() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys[0].current = true;
+        assert!(validation_error(&cfg).contains("more than one TCP-AO key as current"));
+    }
+
+    #[test]
+    fn rejects_empty_or_oversized_secrets_and_passwords() {
+        for secret in [String::new(), "x".repeat(TCP_AUTH_MAX_KEY_LEN + 1)] {
+            let mut cfg = tcp_ao_config();
+            cfg.peers[0].tcp_ao_keys[0].secret = secret.clone();
+            assert!(validation_error(&cfg).contains("invalid secret"));
+
+            let mut cfg = tcp_ao_config();
+            cfg.peers[0].tcp_ao_keys.clear();
+            cfg.peers[0].password = Some(secret);
+            assert!(validation_error(&cfg).contains("invalid password"));
+        }
+
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys[0].secret = "x".repeat(TCP_AUTH_MAX_KEY_LEN);
+        cfg.validate()
+            .expect("an 80-byte secret is the kernel maximum");
     }
 }
