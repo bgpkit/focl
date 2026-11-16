@@ -218,7 +218,11 @@ peer's key, focl logs the error and `focl peer show` reports it as the peer's
 `last_error`. Inbound connections from a peer the listener holds no key for
 are dropped, as nothing would have verified them. Changing keys requires a
 restart.
-`focl peer show` reports `auth_mode` (`none`, `md5` or `tcp-ao`).
+`focl peer show` reports `auth_mode` (`none`, `md5` or `tcp_ao`).
+
+`focld` refuses to start when an enabled peer has `tcp_ao_keys` and the
+kernel has no TCP-AO: such a peer could never get a session. Remove the keys
+or set `enabled = false` on the peer to run the others.
 
 A peer that never connects usually has mismatched keys: the kernel drops
 segments that fail authentication silently. Its counters say why:
@@ -275,7 +279,7 @@ cargo clippy --no-default-features
 | `asn` | u32 | required | Local AS number |
 | `router_id` | string | required | Router ID (IPv4) |
 | `listen` | bool | true | Accept incoming connections |
-| `listen_addr` | string | "0.0.0.0:179" | Bind address |
+| `listen_addr` | string | "0.0.0.0:179" | Bind address; `[::]:179` accepts IPv4 and IPv6 peers |
 | `control_socket` | path | "/tmp/focld.sock" | CLI socket path |
 | `log_level` | string | "info" | Log level |
 
@@ -293,6 +297,9 @@ cargo clippy --no-default-features
 | `password` | string | none | TCP-MD5 password (1-80 bytes) |
 | `tcp_ao_keys` | array | none | TCP-AO keys: `send_id`, `recv_id`, `algorithm`, `secret`, optional `current` |
 | `route_refresh` | bool | true | Enable route refresh |
+
+A key that a `[[peers]]` or `[[peers.tcp_ao_keys]]` table does not know is a
+config error, so a misspelled `password` cannot leave a peer unauthenticated.
 
 ### Prefix Settings
 

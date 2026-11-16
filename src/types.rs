@@ -65,7 +65,7 @@ pub enum PeerState {
 
 /// How a peer's TCP connection is authenticated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum PeerAuthMode {
     #[default]
     None,
@@ -119,5 +119,23 @@ impl EventEnvelope {
             envelope_type: "event".to_string(),
             event,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The control protocol spells its enum values in snake_case.
+    #[test]
+    fn peer_auth_mode_serializes_in_snake_case_like_peer_state() {
+        let encoded = |mode| serde_json::to_value::<PeerAuthMode>(mode).unwrap();
+        assert_eq!(encoded(PeerAuthMode::None), "none");
+        assert_eq!(encoded(PeerAuthMode::Md5), "md5");
+        assert_eq!(encoded(PeerAuthMode::TcpAo), "tcp_ao");
+        assert_eq!(
+            serde_json::to_value(PeerState::OpenSent).unwrap(),
+            "open_sent"
+        );
     }
 }

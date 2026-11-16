@@ -35,9 +35,8 @@ FOCLD_BIN="$ROOT_DIR/target/debug/focld"
 FOCL_BIN="$ROOT_DIR/target/debug/focl"
 
 # /proc/net/netstat lists the TCPAO counters on a >= 6.7 kernel built without
-# CONFIG_TCP_AO too, so probe the socket option through focld: a passive TCP-AO
-# peer makes focld install the key on the listening socket at startup, and a
-# kernel without TCP-AO puts ENOPROTOOPT into that peer's last_error.
+# CONFIG_TCP_AO too, so probe the socket option through focld: it refuses to
+# start with an enabled TCP-AO peer on a kernel without TCP-AO.
 probe_tcp_ao_support() {
 	local dir="$RUNTIME_DIR/ao-support"
 	mkdir -p "$dir"
@@ -72,18 +71,18 @@ EOF
 	for _ in 1 2 3 4 5; do
 		sleep 1
 		shown=$("$FOCL_BIN" --socket "$dir/probe.sock" peer show 127.0.0.1 2>/dev/null)
-		if [[ -n $shown ]]; then
+		if [[ -n $shown ]] || ! kill -0 "$pid" 2>/dev/null; then
 			break
 		fi
 	done
 	kill "$pid" 2>/dev/null
 	wait "$pid" 2>/dev/null
-	if grep -q "TCP-AO needs Linux 6.7" <<<"$shown"; then
+	if grep -q "this kernel has no TCP-AO" "$dir/probe.log"; then
 		echo "this kernel has no TCP-AO (needs Linux 6.7+ built with CONFIG_TCP_AO)" >&2
 		return 1
 	fi
 	if [[ -z $shown ]]; then
-		echo "could not probe TCP-AO support: focld did not answer on $dir/probe.sock" >&2
+		echo "could not probe TCP-AO support: focld did not answer on $dir/probe.sock (see $dir/probe.log)" >&2
 		return 1
 	fi
 	return 0
@@ -196,7 +195,7 @@ wait_for() {
 focl_session_up() {
 	local show
 	show="$("$FOCL_BIN" --socket "$FOCL_SOCKET" peer show "$BIRD_ADDR")"
-	grep -q '"state": "established"' <<<"$show" && grep -q '"auth_mode": "tcp-ao"' <<<"$show"
+	grep -q '"state": "established"' <<<"$show" && grep -q '"auth_mode": "tcp_ao"' <<<"$show"
 }
 
 # Output is captured before grepping: with pipefail, `cmd | grep -q` fails

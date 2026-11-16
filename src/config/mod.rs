@@ -113,7 +113,11 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+/// One `[[peers]]` table. An unknown key is an error: a misspelled `password`
+/// or `tcp_ao_keys` would otherwise leave the peer without the authentication
+/// its config asks for.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     pub address: String,
     pub remote_as: u32,
@@ -197,6 +201,7 @@ pub const TCP_AUTH_MAX_KEY_LEN: usize = 80;
 /// One TCP-AO master key tuple (RFC 5925 s3.1). `send_id` goes into the KeyID
 /// of outgoing segments and has to equal the peer's `recv_id`, and vice versa.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpAoKeyConfig {
     pub send_id: u8,
     pub recv_id: u8,
@@ -876,6 +881,53 @@ current = true
     fn rejects_unknown_tcp_ao_algorithm() {
         let raw = TCP_AO_PEER.replace("aes-128-cmac-96", "hmac-md5");
         assert!(toml::from_str::<FoclConfig>(&raw).is_err());
+    }
+
+    /// A typo must not quietly drop a key's `current` mark, or the keys
+    /// (and with them the peer's authentication) altogether.
+    #[test]
+    fn rejects_unknown_peer_and_tcp_ao_key_fields() {
+        let parse_error = |raw: &str| {
+            toml::from_str::<FoclConfig>(raw)
+                .expect_err("an unknown field should be rejected")
+                .to_string()
+        };
+
+        let error = parse_error(&TCP_AO_PEER.replace("current = true", "currnet = true"));
+        assert!(error.contains("unknown field `currnet`"), "{error}");
+
+        let error =
+            parse_error(&TCP_AO_PEER.replace("[[peers.tcp_ao_keys]]", "[[peers.tcp_ao_key]]"));
+        assert!(error.contains("unknown field `tcp_ao_key`"), "{error}");
+
+        let error = parse_error(
+            &TCP_AO_PEER.replace("remote_as = 65002", "remote_as = 65002\npasswrod = \"md5\""),
+        );
+        assert!(error.contains("unknown field `passwrod`"), "{error}");
+    }
+
+    #[test]
+    fn shipped_example_configs_still_parse_and_validate() {
+        for (name, raw) in [
+            ("focl.toml", include_str!("../../focl.toml")),
+            (
+                "focl-vultr-example.toml",
+                include_str!("../../focl-vultr-example.toml"),
+            ),
+            (
+                "scripts/interop/focl-interop.toml",
+                include_str!("../../scripts/interop/focl-interop.toml"),
+            ),
+            (
+                "scripts/interop/focl-interop-md5.toml",
+                include_str!("../../scripts/interop/focl-interop-md5.toml"),
+            ),
+        ] {
+            let cfg: FoclConfig =
+                toml::from_str(raw).unwrap_or_else(|error| panic!("{name}: {error}"));
+            cfg.validate()
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+        }
     }
 
     #[test]

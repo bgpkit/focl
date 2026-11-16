@@ -33,7 +33,7 @@ Interop OK: Established + prefix 203.0.113.0/24 received by GoBGP
 `scripts/interop/run_bird_tcpao.sh` checks TCP-AO (RFC 5925) against BIRD
 2.17+ or 3.1+, over loopback, in two runs: focld active with HMAC-SHA-1-96,
 then BIRD active with AES-128-CMAC-96. Each run waits for an Established
-session that `focl peer show` reports as `tcp-ao`, and for a route in each
+session that `focl peer show` reports as `tcp_ao`, and for a route in each
 direction. focld uses 127.0.0.1 and BIRD 127.0.0.2. The configs are
 generated into `scripts/interop/.runtime/`. Tested with BIRD 3.4.0.
 
