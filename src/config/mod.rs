@@ -571,7 +571,7 @@ pub enum RibSource {
     LocRib,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ArchiveDestinationConfig {
     #[serde(rename = "type")]
     pub destination_type: DestinationType,
@@ -600,6 +600,50 @@ pub struct ArchiveDestinationConfig {
     pub secret_access_key: Option<String>,
     #[serde(default)]
     pub session_token: Option<String>,
+}
+
+/// Leaves the S3 secret access key and session token out, so a destination
+/// can end up in a log or a panic message. The access key id stays: it names
+/// the credential in use and is no secret, as every signed request carries it
+/// in clear.
+impl fmt::Debug for ArchiveDestinationConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            destination_type,
+            mode,
+            path,
+            required,
+            endpoint,
+            bucket,
+            prefix,
+            upload_concurrency,
+            retry_backoff_secs,
+            max_retries,
+            region,
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } = self;
+        f.debug_struct("ArchiveDestinationConfig")
+            .field("destination_type", destination_type)
+            .field("mode", mode)
+            .field("path", path)
+            .field("required", required)
+            .field("endpoint", endpoint)
+            .field("bucket", bucket)
+            .field("prefix", prefix)
+            .field("upload_concurrency", upload_concurrency)
+            .field("retry_backoff_secs", retry_backoff_secs)
+            .field("max_retries", max_retries)
+            .field("region", region)
+            .field("access_key_id", access_key_id)
+            .field(
+                "secret_access_key",
+                &secret_access_key.as_ref().map(|_| Redacted),
+            )
+            .field("session_token", &session_token.as_ref().map(|_| Redacted))
+            .finish()
+    }
 }
 
 impl ArchiveDestinationConfig {
@@ -875,6 +919,32 @@ current = true
         assert!(printed.contains("address: \"192.0.2.2\""), "{printed}");
         assert!(printed.contains("password: Some(<redacted>)"), "{printed}");
         assert!(!printed.contains("md5-password"), "{printed}");
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_s3_secrets() {
+        let mut cfg = tcp_ao_config();
+        let destination = &mut cfg.archive.destinations[0];
+        assert!(format!("{destination:?}").contains("secret_access_key: None"));
+
+        destination.access_key_id = Some("AKIDEXAMPLE".to_string());
+        destination.secret_access_key = Some("s3-secret".to_string());
+        destination.session_token = Some("s3-token".to_string());
+        let printed = format!("{cfg:?}");
+        assert!(
+            printed.contains("access_key_id: Some(\"AKIDEXAMPLE\")"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("secret_access_key: Some(<redacted>)"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("session_token: Some(<redacted>)"),
+            "{printed}"
+        );
+        assert!(!printed.contains("s3-secret"), "{printed}");
+        assert!(!printed.contains("s3-token"), "{printed}");
     }
 
     #[test]
