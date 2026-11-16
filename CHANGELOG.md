@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixes
 
+* **Inbound peer matching** - a peer configured as an IPv4-mapped literal (`::ffff:192.0.2.1`) matches its own inbound connection again: both the configured and the remote address are canonicalized before comparing.
+* **Listener key installation failures** - every key of a peer is attempted, and a peer whose listener key the kernel refused now carries that failure in `focl peer show` (`last_error`) instead of only in the startup log.
+* **Peer address validation** - a peer address must be a literal IP for every authentication mode, not only for TCP-AO, because the session path and the listener already require one.
+* **Interop TCP-AO probe** - `scripts/interop/run_bird_tcpao.sh` probes the socket option through `focld` instead of grepping `/proc/net/netstat`, which lists the TCPAO counters even on a kernel built without `CONFIG_TCP_AO`.
 * **TCP-MD5 on active sessions** - the key is installed before `connect()` on every active session; without `local_address` it was set after the connect, so the SYN went out unsigned and a peer enforcing TCP-MD5 dropped it.
 * **Dual-stack listener** - an inbound connection on a `[::]` listener is matched against IPv4 peers by its v4-mapped address, and listener keys for IPv4 peers are installed in that form; an IPv6 peer's key is no longer offered to an IPv4-only listener.
 * **TCP-MD5 on the passive listener** - the per-peer keys are installed on the listening socket (Linux `TCP_MD5SIG`) before the accept loop, because the kernel validates the digest on the SYN and `accept()` never returns for a peer whose key is missing; the key is still applied to the accepted socket as well.

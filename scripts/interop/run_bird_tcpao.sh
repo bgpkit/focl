@@ -25,10 +25,6 @@ if [[ "$OSTYPE" != "linux-gnu"* ]]; then
 	echo "TCP-AO is only supported on Linux; skipping on $OSTYPE" >&2
 	exit 0
 fi
-if ! grep -q TCPAOGood /proc/net/netstat; then
-	echo "this kernel has no TCP-AO (needs Linux 6.7+ built with CONFIG_TCP_AO)" >&2
-	exit 1
-fi
 if [[ ! -x "$BIRD_BIN" || ! -x "$BIRDC_BIN" ]]; then
 	echo "bird/birdc not found; set BIRD_BIN and BIRDC_BIN (BIRD 2.17+ or 3.1+)" >&2
 	exit 1
@@ -37,6 +33,63 @@ fi
 cargo build --bin focld --bin focl
 FOCLD_BIN="$ROOT_DIR/target/debug/focld"
 FOCL_BIN="$ROOT_DIR/target/debug/focl"
+
+# /proc/net/netstat lists the TCPAO counters on a >= 6.7 kernel built without
+# CONFIG_TCP_AO too, so probe the socket option through focld: a passive TCP-AO
+# peer makes focld install the key on the listening socket at startup, and a
+# kernel without TCP-AO puts ENOPROTOOPT into that peer's last_error.
+probe_tcp_ao_support() {
+	local dir="$RUNTIME_DIR/ao-support"
+	mkdir -p "$dir"
+	cat >"$dir/probe.toml" <<EOF
+[global]
+asn = 65001
+router_id = "127.0.0.1"
+listen = true
+listen_addr = "127.0.0.1:0"
+control_socket = "$dir/probe.sock"
+log_level = "error"
+
+[[peers]]
+name = "ao-probe"
+address = "127.0.0.1"
+remote_as = 65002
+remote_port = 179
+passive = true
+
+[[peers.tcp_ao_keys]]
+send_id = 1
+recv_id = 2
+algorithm = "hmac-sha1-96"
+secret = "ao-probe"
+
+[archive]
+enabled = false
+EOF
+	"$FOCLD_BIN" --config "$dir/probe.toml" >"$dir/probe.log" 2>&1 &
+	local pid=$!
+	local shown=""
+	for _ in 1 2 3 4 5; do
+		sleep 1
+		shown=$("$FOCL_BIN" --socket "$dir/probe.sock" peer show 127.0.0.1 2>/dev/null)
+		if [[ -n $shown ]]; then
+			break
+		fi
+	done
+	kill "$pid" 2>/dev/null
+	wait "$pid" 2>/dev/null
+	if grep -q "TCP-AO needs Linux 6.7" <<<"$shown"; then
+		echo "this kernel has no TCP-AO (needs Linux 6.7+ built with CONFIG_TCP_AO)" >&2
+		return 1
+	fi
+	if [[ -z $shown ]]; then
+		echo "could not probe TCP-AO support: focld did not answer on $dir/probe.sock" >&2
+		return 1
+	fi
+	return 0
+}
+
+probe_tcp_ao_support || exit 1
 
 FOCL_SOCKET="$RUNTIME_DIR/focld-tcpao.sock"
 BIRD_SOCKET="$RUNTIME_DIR/bird-tcpao.ctl"

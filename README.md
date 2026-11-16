@@ -189,8 +189,10 @@ See `focl-vultr-example.toml` for a complete production-style example with docum
 
 A peer authenticates its TCP connection with either TCP-MD5 (`password`) or
 TCP-AO (`tcp_ao_keys`), never both. TCP-AO takes one or more master key
-tuples; the key marked `current` (else the first) signs, and the others stay
-installed for the peer to use:
+tuples. On an active session the key marked `current` (else the first) signs,
+and the others stay installed for the peer to use. A passive session is the
+other way round: the kernel signs with the key that matches the peer's SYN, so
+`current` is not applied to a listening session:
 
 ```toml
 [[peers]]
@@ -218,8 +220,11 @@ segments that fail authentication silently. Its counters say why:
 nstat -az | grep -E 'TCPAO(Good|Bad|KeyNotFound|Required)'
 ```
 
-`TCPAOBad` means a wrong secret or algorithm, `TCPAOKeyNotFound` a KeyID
-mismatch, and `TCPAORequired` an unsigned segment from a TCP-AO peer.
+* `TCPAOBad`: a segment failed its MAC (wrong secret or algorithm).
+* `TCPAOKeyNotFound`: no installed key matched the segment's KeyID. A listener
+  without `ao_required` also counts an unsigned segment here.
+* `TCPAORequired`: an unsigned segment arrived on a socket that requires
+  TCP-AO, which is our active session side.
 
 ## Development
 

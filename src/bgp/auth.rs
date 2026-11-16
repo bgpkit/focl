@@ -319,6 +319,9 @@ impl TcpSocketExt for tokio::net::TcpSocket {
     }
 
     fn set_tcp_ao_keys(&self, peer_addr: &SocketAddr, keys: &[TcpAoKeyConfig]) -> Result<()> {
+        if keys.is_empty() {
+            anyhow::bail!("set_tcp_ao_keys needs at least one key");
+        }
         let fd = self.as_raw_fd();
         let current = keys.iter().position(|key| key.current).unwrap_or(0);
         for (index, key) in keys.iter().enumerate() {

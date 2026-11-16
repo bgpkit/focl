@@ -178,19 +178,18 @@ fn validate_peer_auth(peer: &PeerConfig) -> Result<()> {
             );
         }
     }
+    // Sessions are keyed by a literal address: the active path parses the peer
+    // address, the listener matches inbound connections against it, and both
+    // kernel authentication options are keyed by address.
+    if peer.address.parse::<std::net::IpAddr>().is_err() {
+        bail!("peer {} needs a literal IP address", peer.address);
+    }
     if peer.tcp_ao_keys.is_empty() {
         return Ok(());
     }
     if peer.password.is_some() {
         bail!(
             "peer {} sets both password (TCP-MD5) and tcp_ao_keys (TCP-AO); pick one",
-            peer.address
-        );
-    }
-    // The kernel keys TCP-AO by peer address, so a hostname cannot be keyed.
-    if peer.address.parse::<std::net::IpAddr>().is_err() {
-        bail!(
-            "peer {} has tcp_ao_keys and needs a literal IP address",
             peer.address
         );
     }
@@ -793,8 +792,14 @@ current = true
     }
 
     #[test]
-    fn rejects_tcp_ao_keys_on_a_hostname_peer() {
+    fn rejects_a_hostname_peer() {
         let mut cfg = tcp_ao_config();
+        cfg.peers[0].address = "router.example".to_string();
+        assert!(validation_error(&cfg).contains("literal IP address"));
+
+        // The same rule applies to a peer with no authentication at all.
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys.clear();
         cfg.peers[0].address = "router.example".to_string();
         assert!(validation_error(&cfg).contains("literal IP address"));
     }

@@ -562,6 +562,7 @@ impl BgpService {
 
     fn make_runtime(&self, peer_cfg: PeerConfig) -> PeerRuntime {
         let local_as = peer_cfg.local_as.unwrap_or(self.inner.global_asn);
+        let auth = peer_auth(&peer_cfg);
         let info = PeerInfo {
             address: peer_cfg.address.clone(),
             name: peer_cfg.name.clone(),
@@ -569,8 +570,8 @@ impl BgpService {
             local_as,
             remote_port: peer_cfg.remote_port,
             passive: peer_cfg.passive,
-            auth_enabled: peer_auth(&peer_cfg).is_some(),
-            auth_mode: match peer_auth(&peer_cfg) {
+            auth_enabled: auth.is_some(),
+            auth_mode: match auth {
                 None => PeerAuthMode::None,
                 Some(PeerAuth::Md5(_)) => PeerAuthMode::Md5,
                 Some(PeerAuth::TcpAo(_)) => PeerAuthMode::TcpAo,
@@ -602,11 +603,18 @@ impl BgpService {
         // TCP-AO MAC when the SYN arrives, so a passive peer's key has to live
         // on the listening socket before `accept()` can ever return for that
         // peer. `accept_inbound` re-checks every accepted connection.
-        install_listener_auth_keys(
+        let failures = install_listener_auth_keys(
             listener.local_addr()?,
             listener.as_raw_fd(),
             &listener_auth_keys(peers),
         );
+        // A peer whose key never reached the socket cannot complete its
+        // handshake, so record that where `focl peer show` reads it instead of
+        // leaving it to the startup log.
+        for (address, error) in failures {
+            self.set_peer_state(&address, PeerState::Idle, Some(error), None)
+                .await;
+        }
         let service = self.clone();
         tokio::spawn(async move {
             loop {
@@ -666,13 +674,7 @@ impl BgpService {
             peers
                 .values()
                 .find(|runtime| {
-                    // A dual-stack listener reports IPv4 peers v4-mapped.
-                    runtime.cfg.enabled
-                        && runtime
-                            .cfg
-                            .address
-                            .parse::<IpAddr>()
-                            .is_ok_and(|address| address == remote.ip().to_canonical())
+                    runtime.cfg.enabled && peer_address_matches(&runtime.cfg.address, remote.ip())
                 })
                 .map(|runtime| runtime.cfg.clone())
         };
@@ -2021,12 +2023,21 @@ fn normalize_socket_addr(raw: &str, default_port: u16) -> Result<SocketAddr> {
 
 /// How a peer authenticates its TCP connection. Config validation keeps the
 /// two mutually exclusive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum PeerAuth {
     /// TCP-MD5 (RFC 2385) password.
     Md5(String),
     /// TCP-AO (RFC 5925) master key tuples.
     TcpAo(Vec<TcpAoKeyConfig>),
+}
+
+impl std::fmt::Debug for PeerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerAuth::Md5(_) => f.write_str("PeerAuth::Md5(<redacted>)"),
+            PeerAuth::TcpAo(keys) => write!(f, "PeerAuth::TcpAo({} keys, <redacted>)", keys.len()),
+        }
+    }
 }
 
 fn peer_auth(peer: &PeerConfig) -> Option<PeerAuth> {
@@ -2037,13 +2048,17 @@ fn peer_auth(peer: &PeerConfig) -> Option<PeerAuth> {
 }
 
 /// Per-peer keys for the listening socket: every enabled peer that
-/// authenticates. A peer whose configured address is not a literal IP cannot
-/// be keyed here; the session path reports such an address.
-fn listener_auth_keys(peers: &[PeerConfig]) -> Vec<(IpAddr, PeerAuth)> {
+/// authenticates, with the configured address kept for diagnostics. Config
+/// validation has already rejected a peer address that is not a literal IP.
+fn listener_auth_keys(peers: &[PeerConfig]) -> Vec<(String, IpAddr, PeerAuth)> {
     peers
         .iter()
         .filter(|peer| peer.enabled)
-        .filter_map(|peer| Some((peer.address.parse::<IpAddr>().ok()?, peer_auth(peer)?)))
+        .filter_map(|peer| {
+            let address = peer.address.parse::<IpAddr>().ok()?;
+            let auth = peer_auth(peer)?;
+            Some((peer.address.clone(), address, auth))
+        })
         .collect()
 }
 
@@ -2061,28 +2076,60 @@ fn listener_key_addr(listener: SocketAddr, peer: IpAddr) -> Option<SocketAddr> {
     Some(SocketAddr::new(address, 179))
 }
 
-/// Installs `keys` on a listening socket. A TCP-AO key goes on without
+/// Installs `keys` on a listening socket, returning one `(peer, error)` entry
+/// per peer whose key could not be installed. A TCP-AO key goes on without
 /// `ao_required`, which would also lock out every other peer, and without
 /// current/rnext, which a listener does not have: the kernel already drops an
 /// unsigned SYN from an address that has a key. A key the kernel refuses is
-/// logged rather than fatal: that peer cannot complete the handshake, but the
-/// listener still serves the others.
-fn install_listener_auth_keys(listener: SocketAddr, fd: i32, keys: &[(IpAddr, PeerAuth)]) {
-    for (address, peer_auth) in keys {
+/// not fatal: that peer cannot complete the handshake, but the listener still
+/// serves the others. Every key of a peer is attempted, so one refused key
+/// does not discard the keys that follow it.
+fn install_listener_auth_keys(
+    listener: SocketAddr,
+    fd: i32,
+    keys: &[(String, IpAddr, PeerAuth)],
+) -> Vec<(String, String)> {
+    let mut failures = Vec::new();
+    for (configured, address, peer_auth) in keys {
         let Some(remote) = listener_key_addr(listener, *address) else {
             tracing::error!(peer=%address, listener=%listener, "IPv4 BGP listener cannot accept an IPv6 peer; not installing its key");
+            failures.push((
+                configured.clone(),
+                format!("peer {address} is IPv6 and listener {listener} is IPv4"),
+            ));
             continue;
         };
-        let result = match peer_auth {
-            PeerAuth::Md5(password) => auth::set_tcp_md5_signature(fd, &remote, password),
-            PeerAuth::TcpAo(ao_keys) => ao_keys
-                .iter()
-                .try_for_each(|key| auth::add_tcp_ao_key(fd, &remote, key, false)),
-        };
-        if let Err(error) = result {
-            tracing::error!(peer=%address, error=%error, "failed to install authentication key on the BGP listener");
+        match peer_auth {
+            PeerAuth::Md5(password) => {
+                if let Err(error) = auth::set_tcp_md5_signature(fd, &remote, password) {
+                    tracing::error!(peer=%address, error=%error, "failed to install authentication key on the BGP listener");
+                    failures.push((configured.clone(), error.to_string()));
+                }
+            }
+            PeerAuth::TcpAo(ao_keys) => {
+                let mut errors = Vec::new();
+                for key in ao_keys {
+                    if let Err(error) = auth::add_tcp_ao_key(fd, &remote, key, false) {
+                        tracing::error!(peer=%address, send_id=key.send_id, error=%error, "failed to install TCP-AO key on the BGP listener");
+                        errors.push(format!("send_id {}: {error}", key.send_id));
+                    }
+                }
+                if !errors.is_empty() {
+                    failures.push((configured.clone(), errors.join("; ")));
+                }
+            }
         }
     }
+    failures
+}
+
+/// Whether a configured peer address names `remote`. Both sides are
+/// canonicalized: a dual-stack listener reports IPv4 peers v4-mapped, and a
+/// peer may be configured as an IPv4-mapped literal.
+fn peer_address_matches(configured: &str, remote: IpAddr) -> bool {
+    configured
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.to_canonical() == remote.to_canonical())
 }
 
 /// Asserts that an accepted connection carries `peer`'s authentication. For
@@ -2318,20 +2365,67 @@ mod tests {
             listener_auth_keys(&peers),
             vec![
                 (
+                    "192.0.2.1".to_string(),
                     "192.0.2.1".parse::<IpAddr>().unwrap(),
                     PeerAuth::Md5("first".to_string())
                 ),
                 (
+                    "2001:db8::1".to_string(),
                     "2001:db8::1".parse::<IpAddr>().unwrap(),
                     PeerAuth::Md5("v6-peer".to_string())
                 ),
                 (
+                    "192.0.2.4".to_string(),
                     "192.0.2.4".parse::<IpAddr>().unwrap(),
                     PeerAuth::TcpAo(ao_keys)
                 ),
             ]
         );
         assert!(listener_auth_keys(&[]).is_empty());
+    }
+
+    #[test]
+    fn peer_address_matching_canonicalizes_both_sides() {
+        // A dual-stack listener reports IPv4 peers v4-mapped.
+        assert!(peer_address_matches(
+            "192.0.2.1",
+            "::ffff:192.0.2.1".parse().unwrap()
+        ));
+        // A peer configured as an IPv4-mapped literal matches the plain form.
+        assert!(peer_address_matches(
+            "::ffff:192.0.2.1",
+            "192.0.2.1".parse().unwrap()
+        ));
+        assert!(peer_address_matches(
+            "2001:db8::1",
+            "2001:db8::1".parse().unwrap()
+        ));
+        assert!(!peer_address_matches(
+            "2001:db8::1",
+            "192.0.2.1".parse().unwrap()
+        ));
+        assert!(!peer_address_matches(
+            "router.example",
+            "192.0.2.1".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn debug_for_peer_auth_redacts_credentials() {
+        let rendered = format!(
+            "{:?} {:?}",
+            PeerAuth::Md5("md5-secret".to_string()),
+            PeerAuth::TcpAo(vec![TcpAoKeyConfig {
+                send_id: 1,
+                recv_id: 2,
+                algorithm: crate::config::TcpAoAlgorithm::HmacSha1_96,
+                secret: "ao-secret".to_string(),
+                current: false,
+            }])
+        );
+        assert!(!rendered.contains("md5-secret"), "{rendered}");
+        assert!(!rendered.contains("ao-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     #[test]
