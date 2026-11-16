@@ -415,4 +415,88 @@ mod tests {
         add_tcp_ao_key(listener.as_raw_fd(), &peer, &first, false).expect("first key");
         assert!(add_tcp_ao_key(listener.as_raw_fd(), &peer, &first, false).is_err());
     }
+
+    /// A listener has no current key: the kernel refuses to set one, and
+    /// gives an accepted connection the keys its SYN names instead. The
+    /// peer's RNextKeyID picks the key that signs and its KeyID the one asked
+    /// of it, so `current` in the config cannot reach a passive session.
+    #[tokio::test]
+    async fn accepted_connection_signs_with_the_key_the_syn_names() {
+        if !tcp_ao_supported() {
+            eprintln!("skipping: kernel has no TCP-AO");
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let local = listener.local_addr().unwrap();
+        let fd = listener.as_raw_fd();
+        let first = key(1, 2, TcpAoAlgorithm::HmacSha1_96);
+        let second = key(3, 4, TcpAoAlgorithm::HmacSha1_96);
+        assert!(
+            add_tcp_ao_key(fd, &local, &first, true).is_err(),
+            "a listening socket takes no current key"
+        );
+        add_tcp_ao_key(fd, &local, &first, false).expect("first listener key");
+        add_tcp_ao_key(fd, &local, &second, false).expect("second listener key");
+
+        // The connecting side mirrors both keys and marks the second current.
+        let mut peer_second = key(4, 3, TcpAoAlgorithm::HmacSha1_96);
+        peer_second.current = true;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .set_tcp_ao_keys(
+                &local,
+                &[key(2, 1, TcpAoAlgorithm::HmacSha1_96), peer_second],
+            )
+            .expect("peer keys");
+        let client = socket.connect(local).await.expect("signed connect");
+        let (accepted, _) = listener.accept().await.expect("accept");
+
+        let connecting = client.tcp_ao_status().unwrap().expect("TCP-AO on the peer");
+        assert_eq!((connecting.current_key, connecting.rnext_key), (4, 3));
+        let passive = accepted.tcp_ao_status().unwrap().expect("TCP-AO on accept");
+        assert_eq!(
+            (passive.current_key, passive.rnext_key),
+            (3, 4),
+            "the SYN, not the order the listener's keys were added in, picks the key"
+        );
+    }
+
+    /// TCP_MD5SIG installs on any socket, also on an accepted connection whose
+    /// handshake carried no signature, and the kernel has no option to read
+    /// back whether a connection is MD5 protected. Setting the key again
+    /// after `accept()` therefore proves nothing: only the key on the
+    /// listening socket makes the kernel drop an unsigned SYN.
+    #[tokio::test]
+    async fn md5_key_installs_on_a_connection_that_was_never_signed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let _client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .expect("unsigned connect");
+        let (accepted, remote) = listener.accept().await.expect("accept");
+        accepted
+            .set_md5_signature(&remote, "md5-password")
+            .expect("the kernel takes the key on an unsigned connection");
+
+        let mut md5sig = [0u8; std::mem::size_of::<linux_raw_sys::net::tcp_md5sig>()];
+        let mut len = md5sig.len() as libc::socklen_t;
+        // SAFETY: `md5sig` and `len` are live and `len` is the size of `md5sig`.
+        let ret = unsafe {
+            libc::getsockopt(
+                accepted.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                linux_raw_sys::net::TCP_MD5SIG as libc::c_int,
+                md5sig.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(ret, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOPROTOOPT)
+        );
+    }
 }

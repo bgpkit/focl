@@ -17,7 +17,7 @@ use ipnet::IpNet;
 use ipnet_trie::IpnetTrie;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
@@ -596,30 +596,34 @@ impl BgpService {
     }
 
     async fn start_listener(&self, listen_addr: &str, peers: &[PeerConfig]) -> Result<()> {
-        let listener = TcpListener::bind(listen_addr)
+        let socket = bind_listener_socket(listen_addr)
             .await
             .with_context(|| format!("failed binding global BGP listener {listen_addr}"))?;
         // RFC 2385 and RFC 5925: the kernel validates the MD5 digest or the
         // TCP-AO MAC when the SYN arrives, so a passive peer's key has to live
-        // on the listening socket before `accept()` can ever return for that
-        // peer. `accept_inbound` re-checks every accepted connection.
-        let failures = install_listener_auth_keys(
-            listener.local_addr()?,
-            listener.as_raw_fd(),
+        // on the listening socket. It goes on before `listen()`: a SYN that
+        // beat its key would be accepted unsigned, and for TCP-MD5 nothing
+        // can tell afterwards. A peer whose key did not make it is refused
+        // in `accept_inbound`.
+        let (unkeyed, failures) = install_listener_auth_keys(
+            socket.local_addr()?,
+            socket.as_raw_fd(),
             &listener_auth_keys(peers),
         );
-        // A peer whose key never reached the socket cannot complete its
-        // handshake, so record that where `focl peer show` reads it instead of
-        // leaving it to the startup log.
+        // Record a key that never reached the socket where `focl peer show`
+        // reads it instead of leaving it to the startup log.
         for (address, error) in failures {
             self.set_peer_state(&address, PeerState::Idle, Some(error), None)
                 .await;
         }
+        let listener = socket
+            .listen(LISTEN_BACKLOG)
+            .with_context(|| format!("failed listening on global BGP listener {listen_addr}"))?;
         let service = self.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((stream, remote)) => service.accept_inbound(stream, remote).await,
+                    Ok((stream, remote)) => service.accept_inbound(stream, remote, &unkeyed).await,
                     Err(error) => tracing::warn!(error=%error, "global BGP listener accept failed"),
                 }
             }
@@ -668,13 +672,22 @@ impl BgpService {
         }
     }
 
-    async fn accept_inbound(&self, stream: TcpStream, remote: SocketAddr) {
+    /// Runs a session on an accepted connection. `unkeyed` holds the peers
+    /// whose authentication key the listener could not take.
+    async fn accept_inbound(
+        &self,
+        stream: TcpStream,
+        remote: SocketAddr,
+        unkeyed: &HashSet<IpAddr>,
+    ) {
+        // A dual-stack listener reports IPv4 peers v4-mapped.
+        let remote_ip = remote.ip().to_canonical();
         let peer = {
             let peers = self.inner.peers.read().await;
             peers
                 .values()
                 .find(|runtime| {
-                    runtime.cfg.enabled && peer_address_matches(&runtime.cfg.address, remote.ip())
+                    runtime.cfg.enabled && peer_address_matches(&runtime.cfg.address, remote_ip)
                 })
                 .map(|runtime| runtime.cfg.clone())
         };
@@ -684,7 +697,7 @@ impl BgpService {
         };
         // Before the collision handling below: a connection that fails here
         // must not tear down an authenticated session the peer already has.
-        if let Err(error) = authenticate_inbound(&stream, &remote, &peer) {
+        if let Err(error) = authenticate_inbound(&stream, &peer, !unkeyed.contains(&remote_ip)) {
             tracing::warn!(peer=%peer.address, error=%error, "dropping inbound BGP connection that failed authentication");
             return;
         }
@@ -2047,6 +2060,44 @@ fn peer_auth(peer: &PeerConfig) -> Option<PeerAuth> {
     peer.password.clone().map(PeerAuth::Md5)
 }
 
+/// The peer's configured address, with an IPv4 peer spelled v4-mapped
+/// (`::ffff:192.0.2.1`) as that IPv4 address: the form an accepted
+/// connection's remote address is compared in. `None` if the address is not a
+/// literal IP.
+fn peer_ip(peer: &PeerConfig) -> Option<IpAddr> {
+    let address = peer.address.parse::<IpAddr>().ok()?;
+    Some(address.to_canonical())
+}
+
+/// Pending inbound connections the BGP listener queues; the kernel caps it at
+/// `net.core.somaxconn`.
+const LISTEN_BACKLOG: u32 = 1024;
+
+/// Binds the socket of the BGP listener the way `TcpListener::bind` does, but
+/// leaves it for the caller to `listen()` on: the authentication keys have to
+/// be on the socket before it takes its first SYN.
+async fn bind_listener_socket(listen_addr: &str) -> std::io::Result<TcpSocket> {
+    let mut last_error = None;
+    for address in tokio::net::lookup_host(listen_addr).await? {
+        let socket = if address.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true)?;
+        match socket.bind(address) {
+            Ok(()) => return Ok(socket),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "could not resolve to any address",
+        )
+    }))
+}
+
 /// Per-peer keys for the listening socket: every enabled peer that
 /// authenticates, with the configured address kept for diagnostics. Config
 /// validation has already rejected a peer address that is not a literal IP.
@@ -2055,7 +2106,7 @@ fn listener_auth_keys(peers: &[PeerConfig]) -> Vec<(String, IpAddr, PeerAuth)> {
         .iter()
         .filter(|peer| peer.enabled)
         .filter_map(|peer| {
-            let address = peer.address.parse::<IpAddr>().ok()?;
+            let address = peer_ip(peer)?;
             let auth = peer_auth(peer)?;
             Some((peer.address.clone(), address, auth))
         })
@@ -2076,19 +2127,23 @@ fn listener_key_addr(listener: SocketAddr, peer: IpAddr) -> Option<SocketAddr> {
     Some(SocketAddr::new(address, 179))
 }
 
-/// Installs `keys` on a listening socket, returning one `(peer, error)` entry
-/// per peer whose key could not be installed. A TCP-AO key goes on without
-/// `ao_required`, which would also lock out every other peer, and without
-/// current/rnext, which a listener does not have: the kernel already drops an
-/// unsigned SYN from an address that has a key. A key the kernel refuses is
-/// not fatal: that peer cannot complete the handshake, but the listener still
-/// serves the others. Every key of a peer is attempted, so one refused key
-/// does not discard the keys that follow it.
+/// Installs `keys` on the socket of the BGP listener. A TCP-AO key goes on
+/// without `ao_required`, which would also lock out every other peer, and
+/// without current/rnext, which a listener does not have: the kernel already
+/// drops an unsigned SYN from an address that has a key. A key the kernel
+/// refuses is logged rather than fatal: the listener still serves the other
+/// peers. Every key of a peer is attempted, so one refused key does not
+/// discard the keys that follow it.
+///
+/// Returns the peers the listener holds no key for, which the caller has to
+/// refuse because the kernel now accepts their unsigned SYN, and one
+/// `(peer, error)` entry per peer with a key that did not go on.
 fn install_listener_auth_keys(
     listener: SocketAddr,
     fd: i32,
     keys: &[(String, IpAddr, PeerAuth)],
-) -> Vec<(String, String)> {
+) -> (HashSet<IpAddr>, Vec<(String, String)>) {
+    let mut unkeyed = HashSet::new();
     let mut failures = Vec::new();
     for (configured, address, peer_auth) in keys {
         let Some(remote) = listener_key_addr(listener, *address) else {
@@ -2102,7 +2157,8 @@ fn install_listener_auth_keys(
         match peer_auth {
             PeerAuth::Md5(password) => {
                 if let Err(error) = auth::set_tcp_md5_signature(fd, &remote, password) {
-                    tracing::error!(peer=%address, error=%error, "failed to install authentication key on the BGP listener");
+                    tracing::error!(peer=%address, error=%error, "failed to install authentication key on the BGP listener; refusing inbound connections from this peer");
+                    unkeyed.insert(*address);
                     failures.push((configured.clone(), error.to_string()));
                 }
             }
@@ -2114,13 +2170,18 @@ fn install_listener_auth_keys(
                         errors.push(format!("send_id {}: {error}", key.send_id));
                     }
                 }
+                // With any key in place the kernel drops an unsigned SYN, and
+                // `authenticate_inbound` checks the accepted connection.
+                if errors.len() == ao_keys.len() {
+                    unkeyed.insert(*address);
+                }
                 if !errors.is_empty() {
                     failures.push((configured.clone(), errors.join("; ")));
                 }
             }
         }
     }
-    failures
+    (unkeyed, failures)
 }
 
 /// Whether a configured peer address names `remote`. Both sides are
@@ -2132,19 +2193,55 @@ fn peer_address_matches(configured: &str, remote: IpAddr) -> bool {
         .is_ok_and(|address| address.to_canonical() == remote.to_canonical())
 }
 
-/// Asserts that an accepted connection carries `peer`'s authentication. For
-/// TCP-AO this checks that the kernel matched a listener key: the docs leave
-/// verifying an `accept()`ed socket's keys to userspace. For TCP-MD5 the
-/// key is installed again; a connection whose SYN failed it never got here.
-fn authenticate_inbound(stream: &TcpStream, remote: &SocketAddr, peer: &PeerConfig) -> Result<()> {
-    match peer_auth(peer) {
-        Some(PeerAuth::TcpAo(_)) => match stream.tcp_ao_status()? {
-            Some(_) => Ok(()),
-            None => Err(anyhow!("connection is not TCP-AO protected")),
-        },
-        Some(PeerAuth::Md5(password)) => stream.set_md5_signature(remote, &password),
-        None => Ok(()),
+/// Asserts that an accepted connection carries `peer`'s authentication.
+/// `listener_keyed` is whether the listening socket took the peer's key.
+///
+/// For TCP-MD5 that key is the whole guarantee: it makes the kernel drop an
+/// unsigned or wrongly signed SYN and hand the key on to the accepted socket,
+/// but nothing can be asked about the connection afterwards. `TCP_MD5SIG`
+/// cannot be read back, and setting it again succeeds on a connection that
+/// was never signed. For TCP-AO the accepted socket can be asked, and the
+/// docs leave verifying its keys to userspace.
+fn authenticate_inbound(stream: &TcpStream, peer: &PeerConfig, listener_keyed: bool) -> Result<()> {
+    let Some(peer_auth) = peer_auth(peer) else {
+        return Ok(());
+    };
+    if !listener_keyed {
+        return Err(anyhow!(
+            "the listener does not hold the peer's key, so nothing verified the connection"
+        ));
     }
+    match peer_auth {
+        PeerAuth::TcpAo(keys) => {
+            let Some(status) = stream.tcp_ao_status()? else {
+                return Err(anyhow!("connection is not TCP-AO protected"));
+            };
+            if let Some(key) = overridden_current_key(&keys, &status) {
+                tracing::warn!(
+                    peer=%peer.address,
+                    configured_send_id=key.send_id,
+                    send_id=status.current_key,
+                    recv_id=status.rnext_key,
+                    "TCP-AO `current` is ignored on a connection the peer opens: its SYN picked the keys"
+                );
+            }
+            Ok(())
+        }
+        PeerAuth::Md5(_) => Ok(()),
+    }
+}
+
+/// The key the config marks `current`, if an accepted connection with
+/// `status` uses another one. Linux gives an accepted connection the keys its
+/// SYN names (the peer's RNextKeyID is the key that signs, its KeyID the one
+/// asked of it), and a listener cannot hold a current key to override that.
+fn overridden_current_key<'a>(
+    keys: &'a [TcpAoKeyConfig],
+    status: &TcpAoStatus,
+) -> Option<&'a TcpAoKeyConfig> {
+    keys.iter()
+        .find(|key| key.current)
+        .filter(|key| key.send_id != status.current_key || key.recv_id != status.rnext_key)
 }
 
 async fn write_bgp_message<W: AsyncWrite + Unpin>(
@@ -2360,6 +2457,7 @@ mod tests {
             md5_peer("not-an-address", true, Some("unusable")),
             ao_peer,
             disabled_ao_peer,
+            md5_peer("::ffff:192.0.2.6", true, Some("v4-mapped")),
         ];
         assert_eq!(
             listener_auth_keys(&peers),
@@ -2378,6 +2476,12 @@ mod tests {
                     "192.0.2.4".to_string(),
                     "192.0.2.4".parse::<IpAddr>().unwrap(),
                     PeerAuth::TcpAo(ao_keys)
+                ),
+                // An IPv4 peer spelled v4-mapped is keyed as the IPv4 peer it is.
+                (
+                    "::ffff:192.0.2.6".to_string(),
+                    "192.0.2.6".parse::<IpAddr>().unwrap(),
+                    PeerAuth::Md5("v4-mapped".to_string())
                 ),
             ]
         );
@@ -2426,6 +2530,105 @@ mod tests {
         assert!(!rendered.contains("md5-secret"), "{rendered}");
         assert!(!rendered.contains("ao-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn listener_key_install_reports_the_peers_it_could_not_key() {
+        let keys = listener_auth_keys(&[
+            md5_peer("192.0.2.1", true, Some("first")),
+            md5_peer("2001:db8::1", true, Some("second")),
+        ]);
+        let listener: SocketAddr = "[::]:179".parse().unwrap();
+        // No socket behind the descriptor: every install fails.
+        let (unkeyed, failures) = install_listener_auth_keys(listener, -1, &keys);
+        assert_eq!(
+            unkeyed,
+            HashSet::from([
+                "192.0.2.1".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse::<IpAddr>().unwrap(),
+            ])
+        );
+        let failed: Vec<&str> = failures.iter().map(|(peer, _)| peer.as_str()).collect();
+        assert_eq!(failed, ["192.0.2.1", "2001:db8::1"]);
+
+        #[cfg(target_os = "linux")]
+        {
+            let socket = TcpSocket::new_v6().unwrap();
+            socket.bind("[::]:0".parse().unwrap()).unwrap();
+            let bound = socket.local_addr().unwrap();
+            let (unkeyed, failures) = install_listener_auth_keys(bound, socket.as_raw_fd(), &keys);
+            assert!(
+                unkeyed.is_empty() && failures.is_empty(),
+                "a socket that is bound but not listening yet takes the keys"
+            );
+        }
+    }
+
+    /// The kernel accepts an unsigned SYN from a peer whose TCP-MD5 key is
+    /// not on the listener, and nothing about the accepted connection says so
+    /// (see `md5_key_installs_on_a_connection_that_was_never_signed`). Such a
+    /// peer must not get a session.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inbound_from_a_peer_the_listener_could_not_key_is_refused() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut cfg = test_service_config();
+        cfg.peers
+            .push(md5_peer("127.0.0.1", true, Some("md5-password")));
+        let (event_tx, _) = broadcast::channel::<EventEnvelope>(4);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+        // A password over the kernel's 80 bytes cannot be installed, which
+        // stands in for any key the listener does not take.
+        let unkeyable = md5_peer("127.0.0.1", true, Some(&"x".repeat(81)));
+        service
+            .start_listener(&format!("127.0.0.1:{port}"), &[unkeyable])
+            .await
+            .unwrap();
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the kernel accepts the unsigned SYN");
+        let mut buf = [0u8; 19];
+        let read = timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("focl kept a connection open that nothing verified");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "an unverified connection got a session: {read:?}"
+        );
+        let peer = service.peer_show("127.0.0.1").await.unwrap();
+        assert!(matches!(peer.state, PeerState::Idle), "{:?}", peer.state);
+    }
+
+    #[test]
+    fn current_key_override_is_only_reported_for_an_explicit_current() {
+        let key = |send_id, recv_id, current| TcpAoKeyConfig {
+            send_id,
+            recv_id,
+            algorithm: crate::config::TcpAoAlgorithm::HmacSha1_96,
+            secret: "ao-secret".to_string(),
+            current,
+        };
+        let status = |current_key, rnext_key| TcpAoStatus {
+            current_key,
+            rnext_key,
+            pkt_good: 0,
+            pkt_bad: 0,
+            pkt_key_not_found: 0,
+            pkt_ao_required: 0,
+        };
+        let keys = [key(1, 2, false), key(3, 4, true)];
+        // The peer's SYN named the first key, the config asks for the second.
+        assert_eq!(overridden_current_key(&keys, &status(1, 2)), Some(&keys[1]));
+        assert_eq!(overridden_current_key(&keys, &status(3, 2)), Some(&keys[1]));
+        assert_eq!(overridden_current_key(&keys, &status(3, 4)), None);
+        // Without an explicit `current` no key was asked for.
+        let unmarked = [key(1, 2, false), key(3, 4, false)];
+        assert_eq!(overridden_current_key(&unmarked, &status(3, 4)), None);
     }
 
     #[test]

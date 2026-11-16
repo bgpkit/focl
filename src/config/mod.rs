@@ -202,8 +202,10 @@ pub struct TcpAoKeyConfig {
     pub recv_id: u8,
     pub algorithm: TcpAoAlgorithm,
     pub secret: String,
-    /// Sign outgoing segments with this key and ask the peer to do the same.
-    /// Defaults to the first key when no key sets it.
+    /// On a connection focl opens: sign outgoing segments with this key and
+    /// ask the peer to do the same, the first key when no key sets it. On a
+    /// connection the peer opens its SYN picks both keys, and this only
+    /// decides whether focl warns about the ones it picked.
     #[serde(default)]
     pub current: bool,
 }

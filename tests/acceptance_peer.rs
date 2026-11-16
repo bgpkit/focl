@@ -947,6 +947,34 @@ async fn dual_stack_listener_serves_an_authenticated_ipv4_peer() -> Result<()> {
     Ok(())
 }
 
+/// An IPv4 peer may be configured in its v4-mapped spelling. It is the same
+/// peer as far as the kernel is concerned, so it is keyed and matched as the
+/// IPv4 address it is.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dual_stack_listener_serves_a_peer_configured_v4_mapped() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("[::]:0")?.local_addr()?.port();
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut peer = test_peer(port, 30);
+    peer.address = "::ffff:127.0.0.1".to_string();
+    peer.password = Some(MD5_PASSWORD.to_string());
+    let listen_addr = format!("[::]:{port}");
+    let _bgp = start_service(&temp, vec![], peer, Some(&listen_addr)).await?;
+
+    assert!(
+        !receives_open(TcpSocket::new_v4()?, remote).await,
+        "an unsigned connection got a session"
+    );
+    let socket = TcpSocket::new_v4()?;
+    socket.set_md5_signature(&remote, MD5_PASSWORD)?;
+    assert!(
+        receives_open(socket, remote).await,
+        "the peer configured as ::ffff:127.0.0.1 got no session from 127.0.0.1"
+    );
+    Ok(())
+}
+
 /// A keyed listener at 127.0.0.1 that only accepts focld's signed SYN, and
 /// an active focld peer dialing it with no `local_address`. Before the key
 /// install moved ahead of `connect()`, that path sent its SYN unsigned.

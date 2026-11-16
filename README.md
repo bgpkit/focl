@@ -189,10 +189,7 @@ See `focl-vultr-example.toml` for a complete production-style example with docum
 
 A peer authenticates its TCP connection with either TCP-MD5 (`password`) or
 TCP-AO (`tcp_ao_keys`), never both. TCP-AO takes one or more master key
-tuples. On an active session the key marked `current` (else the first) signs,
-and the others stay installed for the peer to use. A passive session is the
-other way round: the kernel signs with the key that matches the peer's SYN, so
-`current` is not applied to a listening session:
+tuples:
 
 ```toml
 [[peers]]
@@ -207,11 +204,21 @@ algorithm = "hmac-sha1-96"     # or "aes-128-cmac-96" (RFC 5926)
 secret = "[REDACTED]"          # 1-80 bytes
 ```
 
+On a connection focl opens, the key marked `current = true` (else the first)
+signs and is the one focl asks the peer to sign with; the others stay
+installed for the peer to use. On a connection the peer opens, the peer's SYN
+picks both keys (Linux does not let a listener choose), so `current` has no
+effect there and focl logs a warning when the session runs on other keys.
+
 The keys are installed before `connect()` on active sessions and on the
-listening socket for passive ones, so the kernel verifies the very first
-SYN; an accepted connection from a TCP-AO peer is also checked to really be
-TCP-AO protected. Changing keys requires a restart. `focl peer show` reports
-`auth_mode` (`none`, `md5` or `tcp-ao`).
+listening socket, before it starts listening, for passive ones, so the kernel
+verifies the very first SYN; an accepted connection from a TCP-AO peer is
+also checked to really be TCP-AO protected. If the listening socket refuses a
+peer's key, focl logs the error and `focl peer show` reports it as the peer's
+`last_error`. Inbound connections from a peer the listener holds no key for
+are dropped, as nothing would have verified them. Changing keys requires a
+restart.
+`focl peer show` reports `auth_mode` (`none`, `md5` or `tcp-ao`).
 
 A peer that never connects usually has mismatched keys: the kernel drops
 segments that fail authentication silently. Its counters say why:
