@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -112,7 +113,7 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
     pub address: String,
     pub remote_as: u32,
@@ -143,12 +144,59 @@ pub struct PeerConfig {
     pub tcp_ao_keys: Vec<TcpAoKeyConfig>,
 }
 
+/// Stands in for a secret in `Debug` output.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Leaves the TCP-MD5 password out, so a peer can end up in a log or a panic
+/// message. The destructuring makes a new field a compile error here rather
+/// than a field that silently goes unprinted.
+impl fmt::Debug for PeerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            address,
+            remote_as,
+            local_as,
+            hold_time_secs,
+            connect_retry_secs,
+            remote_port,
+            local_address,
+            enabled,
+            passive,
+            route_refresh,
+            name,
+            password,
+            tcp_ao_keys,
+        } = self;
+        f.debug_struct("PeerConfig")
+            .field("address", address)
+            .field("remote_as", remote_as)
+            .field("local_as", local_as)
+            .field("hold_time_secs", hold_time_secs)
+            .field("connect_retry_secs", connect_retry_secs)
+            .field("remote_port", remote_port)
+            .field("local_address", local_address)
+            .field("enabled", enabled)
+            .field("passive", passive)
+            .field("route_refresh", route_refresh)
+            .field("name", name)
+            .field("password", &password.as_ref().map(|_| Redacted))
+            .field("tcp_ao_keys", tcp_ao_keys)
+            .finish()
+    }
+}
+
 /// The longest TCP-MD5 password or TCP-AO secret the Linux kernel accepts.
 pub const TCP_AUTH_MAX_KEY_LEN: usize = 80;
 
 /// One TCP-AO master key tuple (RFC 5925 s3.1). `send_id` goes into the KeyID
 /// of outgoing segments and has to equal the peer's `recv_id`, and vice versa.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TcpAoKeyConfig {
     pub send_id: u8,
     pub recv_id: u8,
@@ -158,6 +206,26 @@ pub struct TcpAoKeyConfig {
     /// Defaults to the first key when no key sets it.
     #[serde(default)]
     pub current: bool,
+}
+
+/// Leaves the secret out, so a key can end up in a log or a panic message.
+impl fmt::Debug for TcpAoKeyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            send_id,
+            recv_id,
+            algorithm,
+            secret: _,
+            current,
+        } = self;
+        f.debug_struct("TcpAoKeyConfig")
+            .field("send_id", send_id)
+            .field("recv_id", recv_id)
+            .field("algorithm", algorithm)
+            .field("secret", &Redacted)
+            .field("current", current)
+            .finish()
+    }
 }
 
 /// The RFC 5926 MAC algorithms, both with a 96-bit MAC.
@@ -776,6 +844,30 @@ current = true
         let encoded = toml::to_string(&cfg).expect("config should serialize");
         let reparsed: FoclConfig = toml::from_str(&encoded).expect("roundtrip should parse");
         assert_eq!(reparsed.peers[0].tcp_ao_keys, *keys);
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_tcp_ao_secret() {
+        let cfg = tcp_ao_config();
+        let printed = format!("{:?}", cfg.peers[0]);
+        assert!(printed.contains("send_id: 1"), "{printed}");
+        assert!(printed.contains("secret: <redacted>"), "{printed}");
+        assert!(!printed.contains("first"), "{printed}");
+        assert!(!printed.contains("second"), "{printed}");
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_md5_password() {
+        let mut cfg = tcp_ao_config();
+        let peer = &mut cfg.peers[0];
+        peer.tcp_ao_keys.clear();
+        assert!(format!("{peer:?}").contains("password: None"));
+
+        peer.password = Some("md5-password".to_string());
+        let printed = format!("{cfg:?}");
+        assert!(printed.contains("address: \"192.0.2.2\""), "{printed}");
+        assert!(printed.contains("password: Some(<redacted>)"), "{printed}");
+        assert!(!printed.contains("md5-password"), "{printed}");
     }
 
     #[test]
