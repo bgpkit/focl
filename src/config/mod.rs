@@ -594,6 +594,11 @@ pub struct ArchiveDestinationConfig {
     pub max_retries: Option<u32>,
     #[serde(default)]
     pub region: Option<String>,
+    // TODO: deprecate `access_key_id`, `secret_access_key` and
+    // `session_token`. Nothing has ever read them: the replicator builds its
+    // S3 client from the default AWS credential chain (environment, profile,
+    // instance role), so setting them here has no effect. Warn at load when
+    // one is set, then drop them.
     #[serde(default)]
     pub access_key_id: Option<String>,
     #[serde(default)]
