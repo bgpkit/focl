@@ -2028,8 +2028,8 @@ async fn connect_with_optional_bind(peer: &PeerConfig, remote: SocketAddr) -> Re
     // RFC 2385 and RFC 5925: the SYN is the first segment the peer verifies,
     // so the key has to be on the socket before `connect()`.
     match peer_auth(peer) {
-        Some(PeerAuth::Md5(password)) => socket.set_md5_signature(&remote, &password)?,
-        Some(PeerAuth::TcpAo(keys)) => socket.set_tcp_ao_keys(&remote, &keys)?,
+        Some(PeerAuth::Md5(password)) => socket.set_md5_signature(&remote, password)?,
+        Some(PeerAuth::TcpAo(keys)) => socket.set_tcp_ao_keys(&remote, keys)?,
         None => {}
     }
     Ok(socket.connect(remote).await?)
@@ -2045,17 +2045,18 @@ fn normalize_socket_addr(raw: &str, default_port: u16) -> Result<SocketAddr> {
     Ok(SocketAddr::new(address, default_port))
 }
 
-/// How a peer authenticates its TCP connection. The two are mutually
-/// exclusive: `BgpService` validates its config before it reads a peer.
-#[derive(Clone, PartialEq, Eq)]
-enum PeerAuth {
+/// How a peer authenticates its TCP connection: a view of the secrets in its
+/// `PeerConfig`, which stays their only copy. The two are mutually exclusive:
+/// `BgpService` validates its config before it reads a peer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerAuth<'a> {
     /// TCP-MD5 (RFC 2385) password.
-    Md5(String),
+    Md5(&'a str),
     /// TCP-AO (RFC 5925) master key tuples.
-    TcpAo(Vec<TcpAoKeyConfig>),
+    TcpAo(&'a [TcpAoKeyConfig]),
 }
 
-impl std::fmt::Debug for PeerAuth {
+impl std::fmt::Debug for PeerAuth<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PeerAuth::Md5(_) => f.write_str("PeerAuth::Md5(<redacted>)"),
@@ -2064,11 +2065,11 @@ impl std::fmt::Debug for PeerAuth {
     }
 }
 
-fn peer_auth(peer: &PeerConfig) -> Option<PeerAuth> {
+fn peer_auth(peer: &PeerConfig) -> Option<PeerAuth<'_>> {
     if !peer.tcp_ao_keys.is_empty() {
-        return Some(PeerAuth::TcpAo(peer.tcp_ao_keys.clone()));
+        return Some(PeerAuth::TcpAo(&peer.tcp_ao_keys));
     }
-    peer.password.clone().map(PeerAuth::Md5)
+    peer.password.as_deref().map(PeerAuth::Md5)
 }
 
 /// Fails when an enabled peer has TCP-AO keys and the kernel has no TCP-AO
@@ -2131,7 +2132,7 @@ async fn bind_listener_socket(listen_addr: &str) -> std::io::Result<TcpSocket> {
 /// Per-peer keys for the listening socket: every enabled peer that
 /// authenticates, with the configured address kept for diagnostics. Config
 /// validation has already rejected a peer address that is not a literal IP.
-fn listener_auth_keys(peers: &[PeerConfig]) -> Vec<(String, IpAddr, PeerAuth)> {
+fn listener_auth_keys(peers: &[PeerConfig]) -> Vec<(String, IpAddr, PeerAuth<'_>)> {
     peers
         .iter()
         .filter(|peer| peer.enabled)
@@ -2196,7 +2197,7 @@ fn unreachable_passive_peers(listener: SocketAddr, peers: &[PeerConfig]) -> Vec<
 fn install_listener_auth_keys(
     listener: SocketAddr,
     fd: i32,
-    keys: &[(String, IpAddr, PeerAuth)],
+    keys: &[(String, IpAddr, PeerAuth<'_>)],
 ) -> (HashSet<IpAddr>, Vec<(String, String)>) {
     let mut unkeyed = HashSet::new();
     let mut failures = Vec::new();
@@ -2209,7 +2210,7 @@ fn install_listener_auth_keys(
             unkeyed.insert(*address);
             continue;
         };
-        match peer_auth {
+        match *peer_auth {
             PeerAuth::Md5(password) => {
                 if let Err(error) = auth::set_tcp_md5_signature(fd, &remote, password) {
                     tracing::error!(peer=%address, error=%error, "failed to install authentication key on the BGP listener; refusing inbound connections from this peer");
@@ -2271,7 +2272,7 @@ fn authenticate_inbound(stream: &TcpStream, peer: &PeerConfig, listener_keyed: b
             let Some(status) = stream.tcp_ao_status()? else {
                 return Err(anyhow!("connection is not TCP-AO protected"));
             };
-            if let Some(key) = overridden_current_key(&keys, &status) {
+            if let Some(key) = overridden_current_key(keys, &status) {
                 tracing::warn!(
                     peer=%peer.address,
                     configured_send_id=key.send_id,
@@ -2520,23 +2521,23 @@ mod tests {
                 (
                     "192.0.2.1".to_string(),
                     "192.0.2.1".parse::<IpAddr>().unwrap(),
-                    PeerAuth::Md5("first".to_string())
+                    PeerAuth::Md5("first")
                 ),
                 (
                     "2001:db8::1".to_string(),
                     "2001:db8::1".parse::<IpAddr>().unwrap(),
-                    PeerAuth::Md5("v6-peer".to_string())
+                    PeerAuth::Md5("v6-peer")
                 ),
                 (
                     "192.0.2.4".to_string(),
                     "192.0.2.4".parse::<IpAddr>().unwrap(),
-                    PeerAuth::TcpAo(ao_keys)
+                    PeerAuth::TcpAo(&ao_keys)
                 ),
                 // An IPv4 peer spelled v4-mapped is keyed as the IPv4 peer it is.
                 (
                     "::ffff:192.0.2.6".to_string(),
                     "192.0.2.6".parse::<IpAddr>().unwrap(),
-                    PeerAuth::Md5("v4-mapped".to_string())
+                    PeerAuth::Md5("v4-mapped")
                 ),
             ]
         );
@@ -2573,8 +2574,8 @@ mod tests {
     fn debug_for_peer_auth_redacts_credentials() {
         let rendered = format!(
             "{:?} {:?}",
-            PeerAuth::Md5("md5-secret".to_string()),
-            PeerAuth::TcpAo(vec![TcpAoKeyConfig {
+            PeerAuth::Md5("md5-secret"),
+            PeerAuth::TcpAo(&[TcpAoKeyConfig {
                 send_id: 1,
                 recv_id: 2,
                 algorithm: crate::config::TcpAoAlgorithm::HmacSha1_96,
@@ -2589,10 +2590,11 @@ mod tests {
 
     #[test]
     fn listener_key_install_reports_the_peers_it_could_not_key() {
-        let keys = listener_auth_keys(&[
+        let peers = [
             md5_peer("192.0.2.1", true, Some("first")),
             md5_peer("2001:db8::1", true, Some("second")),
-        ]);
+        ];
+        let keys = listener_auth_keys(&peers);
         let listener: SocketAddr = "[::]:179".parse().unwrap();
         // No socket behind the descriptor: every install fails.
         let (unkeyed, failures) = install_listener_auth_keys(listener, -1, &keys);
