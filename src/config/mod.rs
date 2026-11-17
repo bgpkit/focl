@@ -37,7 +37,20 @@ impl FoclConfig {
             bail!("[global].router_id must be a valid IPv4 address");
         }
 
+        // One peer per address: an inbound connection matches a peer by IP, so
+        // two spellings of the same address (`192.0.2.1` and `::ffff:192.0.2.1`)
+        // would leave the choice of peer, its remote AS and its key undefined.
+        let mut seen: std::collections::HashMap<std::net::IpAddr, &str> =
+            std::collections::HashMap::new();
         for peer in &self.peers {
+            if let Ok(address) = peer.address.parse::<std::net::IpAddr>() {
+                if let Some(first) = seen.insert(address.to_canonical(), peer.address.as_str()) {
+                    bail!(
+                        "peers {first} and {} are the same address in different spellings",
+                        peer.address
+                    );
+                }
+            }
             if peer.remote_as == 0 {
                 bail!("peer {} has invalid remote_as 0", peer.address);
             }
@@ -1023,6 +1036,16 @@ current = true
         cfg.peers[0].tcp_ao_keys.clear();
         cfg.peers[0].address = "router.example".to_string();
         assert!(validation_error(&cfg).contains("literal IP address"));
+    }
+
+    #[test]
+    fn rejects_two_spellings_of_one_peer_address() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].address = "192.0.2.1".to_string();
+        let mut alias = cfg.peers[0].clone();
+        alias.address = "::ffff:192.0.2.1".to_string();
+        cfg.peers.push(alias);
+        assert!(validation_error(&cfg).contains("same address in different spellings"));
     }
 
     #[test]

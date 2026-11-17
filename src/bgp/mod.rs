@@ -50,6 +50,12 @@ pub struct PeerInfo {
     pub auth_mode: PeerAuthMode,
     pub state: PeerState,
     pub last_error: Option<String>,
+    /// Set when a key for this peer could not be installed on the listening
+    /// socket. Unlike `last_error` it is not a session outcome, so a later
+    /// connection error or a session that established with the keys that did
+    /// install never clears it.
+    #[serde(default)]
+    pub listener_key_error: Option<String>,
     pub advertised_prefixes: usize,
     pub established_at: Option<i64>,
 }
@@ -582,6 +588,7 @@ impl BgpService {
             },
             state: PeerState::Idle,
             last_error: None,
+            listener_key_error: None,
             advertised_prefixes: 0,
             established_at: None,
         };
@@ -616,6 +623,8 @@ impl BgpService {
         // can never connect, where `focl peer show` reads it instead of
         // leaving it to the startup log.
         for (address, error) in failures {
+            self.set_peer_listener_key_error(&address, error.clone())
+                .await;
             self.set_peer_state(&address, PeerState::Idle, Some(error), None)
                 .await;
         }
@@ -1246,6 +1255,12 @@ impl BgpService {
             runtime.info.advertised_prefixes = advertised;
         }
         Ok(())
+    }
+
+    async fn set_peer_listener_key_error(&self, address: &str, error: String) {
+        if let Some(runtime) = self.inner.peers.write().await.get_mut(address) {
+            runtime.info.listener_key_error = Some(error);
+        }
     }
 
     async fn set_peer_state(
@@ -2109,16 +2124,22 @@ const LISTEN_BACKLOG: u32 = 1024;
 /// leaves it for the caller to `listen()` on: the authentication keys have to
 /// be on the socket before it takes its first SYN.
 async fn bind_listener_socket(listen_addr: &str) -> std::io::Result<TcpSocket> {
+    let addresses: Vec<SocketAddr> = tokio::net::lookup_host(listen_addr).await?.collect();
+    bind_first_listener(addresses, bind_listener_one)
+}
+
+/// Binds the first address that accepts a socket, like `TcpListener::bind`:
+/// socket creation, `SO_REUSEADDR` and `bind` all belong to one attempt, so a
+/// family this host cannot create a socket for falls through to the next
+/// resolved address instead of aborting startup.
+fn bind_first_listener(
+    addresses: Vec<SocketAddr>,
+    mut bind: impl FnMut(SocketAddr) -> std::io::Result<TcpSocket>,
+) -> std::io::Result<TcpSocket> {
     let mut last_error = None;
-    for address in tokio::net::lookup_host(listen_addr).await? {
-        let socket = if address.is_ipv4() {
-            TcpSocket::new_v4()?
-        } else {
-            TcpSocket::new_v6()?
-        };
-        socket.set_reuseaddr(true)?;
-        match socket.bind(address) {
-            Ok(()) => return Ok(socket),
+    for address in addresses {
+        match bind(address) {
+            Ok(socket) => return Ok(socket),
             Err(error) => last_error = Some(error),
         }
     }
@@ -2128,6 +2149,17 @@ async fn bind_listener_socket(listen_addr: &str) -> std::io::Result<TcpSocket> {
             "could not resolve to any address",
         )
     }))
+}
+
+fn bind_listener_one(address: SocketAddr) -> std::io::Result<TcpSocket> {
+    let socket = if address.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    Ok(socket)
 }
 
 /// Per-peer keys for the listening socket: every enabled peer that
@@ -2546,6 +2578,35 @@ mod tests {
     }
 
     #[test]
+    fn listener_binding_falls_through_to_the_next_address() {
+        let addresses = vec![
+            "192.0.2.1:179".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        ];
+        let socket = bind_first_listener(addresses, |address| {
+            if address.ip().to_string() == "192.0.2.1" {
+                return Err(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable));
+            }
+            bind_listener_one(address)
+        })
+        .expect("the second address binds");
+        assert_eq!(socket.local_addr().unwrap().ip().to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn listener_binding_reports_the_last_error() {
+        let addresses = vec![
+            "192.0.2.1:179".parse().unwrap(),
+            "192.0.2.2:179".parse().unwrap(),
+        ];
+        let error = bind_first_listener(addresses, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))
+        })
+        .expect_err("no address binds");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrNotAvailable);
+    }
+
+    #[test]
     fn peer_address_matching_canonicalizes_both_sides() {
         // A dual-stack listener reports IPv4 peers v4-mapped.
         assert!(peer_address_matches(
@@ -2675,6 +2736,19 @@ mod tests {
         );
         let peer = service.peer_show("127.0.0.1").await.unwrap();
         assert!(matches!(peer.state, PeerState::Idle), "{:?}", peer.state);
+        let recorded = peer
+            .listener_key_error
+            .clone()
+            .expect("the key the listener refused is reported");
+        assert!(recorded.contains("password too long"), "{recorded}");
+
+        // A session that comes up later must not erase the listener's failure:
+        // the peer still runs without the key that could not be installed.
+        service
+            .set_peer_state("127.0.0.1", PeerState::Established, None, Some(0))
+            .await;
+        let peer = service.peer_show("127.0.0.1").await.unwrap();
+        assert_eq!(peer.listener_key_error, Some(recorded));
     }
 
     #[test]

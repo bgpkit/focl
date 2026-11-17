@@ -218,7 +218,10 @@ peer's key, focl logs the error and `focl peer show` reports it as the peer's
 `last_error`. Inbound connections from a peer the listener holds no key for
 are dropped, as nothing would have verified them. Changing keys requires a
 restart.
-`focl peer show` reports `auth_mode` (`none`, `md5` or `tcp_ao`).
+`focl peer show` reports `auth_mode` (`none`, `md5` or `tcp_ao`), and a key the
+kernel refused to install on the listening socket appears there as
+`listener_key_error`; the peer keeps running without that key and a later
+session error does not clear the field.
 
 `focld` refuses to start when an enabled peer has `tcp_ao_keys` and the
 kernel has no TCP-AO: such a peer could never get a session. Remove the keys
@@ -232,10 +235,10 @@ nstat -az | grep -E 'TCPAO(Good|Bad|KeyNotFound|Required)'
 ```
 
 * `TCPAOBad`: a segment failed its MAC (wrong secret or algorithm).
-* `TCPAOKeyNotFound`: no installed key matched the segment's KeyID. A listener
-  without `ao_required` also counts an unsigned segment here.
-* `TCPAORequired`: an unsigned segment arrived on a socket that requires
-  TCP-AO, which is our active session side.
+* `TCPAOKeyNotFound`: no installed key matched the segment, which includes an
+  unsigned segment on a connection that requires TCP-AO.
+* `TCPAORequired`: an unsigned segment reached a listener that holds a key for
+  that peer; the kernel requires TCP-AO whenever a key exists.
 
 ## Development
 

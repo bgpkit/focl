@@ -495,6 +495,17 @@ async fn start_service(
     peer: PeerConfig,
     listen_addr: Option<&str>,
 ) -> Result<BgpService> {
+    start_service_with_peers(temp, prefixes, vec![peer], listen_addr).await
+}
+
+/// Starts focld with several peers on one service, for cases where more than
+/// one peer shares the listener.
+async fn start_service_with_peers(
+    temp: &tempfile::TempDir,
+    prefixes: Vec<PrefixConfig>,
+    peers: Vec<PeerConfig>,
+    listen_addr: Option<&str>,
+) -> Result<BgpService> {
     let cfg = FoclConfig {
         global: GlobalConfig {
             asn: FOCL_AS,
@@ -504,7 +515,7 @@ async fn start_service(
             control_socket: temp.path().join("focld.sock"),
             log_level: "warn".to_string(),
         },
-        peers: vec![peer],
+        peers,
         prefixes,
         archive: ArchiveConfig {
             enabled: false,
@@ -796,6 +807,71 @@ async fn receives_open(socket: TcpSocket, remote: SocketAddr) -> bool {
         timeout(Duration::from_secs(2), read_message(&mut stream)).await,
         Ok(Ok(BgpMessage::Open(_)))
     )
+}
+
+/// Round 1 left one case open: a single listener must serve a keyed peer and a
+/// peer with no authentication at the same time. The listener holds the keyed
+/// peer's key without requiring TCP-AO for everyone, and the unkeyed peer's
+/// session is not treated as authenticated.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn one_listener_serves_a_keyed_and_an_unkeyed_peer() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+
+    let mut keyed = test_peer(port, 30);
+    keyed.address = "127.0.0.2".to_string();
+    keyed.password = Some(MD5_PASSWORD.to_string());
+    let mut plain = test_peer(port, 30);
+    plain.address = "127.0.0.3".to_string();
+
+    let bgp = start_service_with_peers(
+        &temp,
+        focl_v4_prefix(),
+        vec![keyed, plain],
+        Some(&format!("127.0.0.1:{port}")),
+    )
+    .await?;
+
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+
+    // The keyed peer installs its key before the SYN, like a router would.
+    let keyed_socket = TcpSocket::new_v4()?;
+    keyed_socket.bind(SocketAddr::from(([127, 0, 0, 2], 0)))?;
+    keyed_socket
+        .set_md5_signature(&remote, MD5_PASSWORD)
+        .context("installing the peer-side TCP-MD5 key (needs CAP_NET_ADMIN)")?;
+    let mut keyed_stream = timeout(Duration::from_secs(5), keyed_socket.connect(remote)).await??;
+
+    let plain_socket = TcpSocket::new_v4()?;
+    plain_socket.bind(SocketAddr::from(([127, 0, 0, 3], 0)))?;
+    let mut plain_stream = timeout(Duration::from_secs(5), plain_socket.connect(remote)).await??;
+
+    for (peer_address, stream, mode) in [
+        ("127.0.0.2", &mut keyed_stream, PeerAuthMode::Md5),
+        ("127.0.0.3", &mut plain_stream, PeerAuthMode::None),
+    ] {
+        assert!(matches!(read_message(stream).await?, BgpMessage::Open(_)));
+        write_message(stream, &peer_open()).await?;
+        assert!(matches!(read_message(stream).await?, BgpMessage::KeepAlive));
+        write_message(stream, &BgpMessage::KeepAlive).await?;
+        assert!(
+            matches!(read_message(stream).await?, BgpMessage::Update(_)),
+            "{peer_address} did not get the establishment table"
+        );
+        assert!(ipv4_eor(&read_message(stream).await?));
+        let peer = bgp
+            .peer_show(peer_address)
+            .await
+            .context("the peer stays configured")?;
+        assert!(
+            matches!(peer.state, PeerState::Established),
+            "{peer_address}: {:?}",
+            peer.state
+        );
+        assert_eq!(peer.auth_mode, mode, "{peer_address}");
+    }
+    Ok(())
 }
 
 /// TCP-AO (RFC 5925) on a passive session, for both RFC 5926 algorithms: the
