@@ -235,10 +235,12 @@ nstat -az | grep -E 'TCPAO(Good|Bad|KeyNotFound|Required)'
 ```
 
 * `TCPAOBad`: a segment failed its MAC (wrong secret or algorithm).
-* `TCPAOKeyNotFound`: no installed key matched the segment, which includes an
-  unsigned segment on a connection that requires TCP-AO.
-* `TCPAORequired`: an unsigned segment reached a listener that holds a key for
-  that peer; the kernel requires TCP-AO whenever a key exists.
+* `TCPAOKeyNotFound`: a segment carried a TCP-AO option whose KeyID matched no
+  installed key, which includes a signed SYN from a peer the socket has no key
+  for.
+* `TCPAORequired`: an unsigned segment reached a socket that requires TCP-AO:
+  a listener that holds a key for that peer, or a session we opened with
+  `ao_required`.
 
 ## Development
 
@@ -282,7 +284,7 @@ cargo clippy --no-default-features
 | `asn` | u32 | required | Local AS number |
 | `router_id` | string | required | Router ID (IPv4) |
 | `listen` | bool | true | Accept incoming connections |
-| `listen_addr` | string | "0.0.0.0:179" | Bind address; `[::]:179` accepts IPv4 and IPv6 peers |
+| `listen_addr` | string | "0.0.0.0:179" | Bind address; `[::]:179` accepts IPv4 peers as v4-mapped while the socket's `IPV6_V6ONLY` is 0, which is the Linux default |
 | `control_socket` | path | "/tmp/focld.sock" | CLI socket path |
 | `log_level` | string | "info" | Log level |
 

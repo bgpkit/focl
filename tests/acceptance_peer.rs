@@ -847,34 +847,80 @@ async fn one_listener_serves_a_keyed_and_an_unkeyed_peer() -> Result<()> {
     plain_socket.bind(SocketAddr::from(([127, 0, 0, 3], 0)))?;
     let mut plain_stream = timeout(Duration::from_secs(5), plain_socket.connect(remote)).await??;
 
-    for (peer_address, stream, mode) in [
-        ("127.0.0.2", &mut keyed_stream, PeerAuthMode::Md5),
-        ("127.0.0.3", &mut plain_stream, PeerAuthMode::None),
-    ] {
-        assert!(matches!(read_message(stream).await?, BgpMessage::Open(_)));
-        write_message(stream, &peer_open()).await?;
-        assert!(matches!(read_message(stream).await?, BgpMessage::KeepAlive));
-        write_message(stream, &BgpMessage::KeepAlive).await?;
-        assert!(
-            matches!(read_message(stream).await?, BgpMessage::Update(_)),
-            "{peer_address} did not get the establishment table"
-        );
-        assert!(ipv4_eor(&read_message(stream).await?));
-        let peer = bgp
-            .peer_show(peer_address)
-            .await
-            .context("the peer stays configured")?;
-        assert!(
-            matches!(peer.state, PeerState::Established),
-            "{peer_address}: {:?}",
-            peer.state
-        );
-        assert_eq!(peer.auth_mode, mode, "{peer_address}");
+    complete_session_as(&bgp, "127.0.0.2", &mut keyed_stream, PeerAuthMode::Md5).await?;
+    complete_session_as(&bgp, "127.0.0.3", &mut plain_stream, PeerAuthMode::None).await
+}
+
+/// The same listener case with TCP-AO: the listener holds the AO peer's key
+/// without setting `ao_required`, so an unauthenticated peer on the same socket
+/// still gets its session.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn one_listener_serves_an_ao_and_an_unkeyed_peer() -> Result<()> {
+    if !tcp_ao_or_skip("one_listener_serves_an_ao_and_an_unkeyed_peer") {
+        return Ok(());
     }
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+
+    let algorithm = TcpAoAlgorithm::HmacSha1_96;
+    let mut keyed = test_peer(port, 30);
+    keyed.address = "127.0.0.2".to_string();
+    keyed.tcp_ao_keys = focl_ao_keys(algorithm);
+    let mut plain = test_peer(port, 30);
+    plain.address = "127.0.0.3".to_string();
+
+    let bgp = start_service_with_peers(
+        &temp,
+        focl_v4_prefix(),
+        vec![keyed, plain],
+        Some(&format!("127.0.0.1:{port}")),
+    )
+    .await?;
+
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+    let keyed_socket = TcpSocket::new_v4()?;
+    keyed_socket.bind(SocketAddr::from(([127, 0, 0, 2], 0)))?;
+    keyed_socket.set_tcp_ao_keys(&remote, &peer_ao_keys(algorithm, AO_SECRET))?;
+    let mut keyed_stream = timeout(Duration::from_secs(5), keyed_socket.connect(remote)).await??;
+
+    let plain_socket = TcpSocket::new_v4()?;
+    plain_socket.bind(SocketAddr::from(([127, 0, 0, 3], 0)))?;
+    let mut plain_stream = timeout(Duration::from_secs(5), plain_socket.connect(remote)).await??;
+
+    complete_session_as(&bgp, "127.0.0.2", &mut keyed_stream, PeerAuthMode::TcpAo).await?;
+    complete_session_as(&bgp, "127.0.0.3", &mut plain_stream, PeerAuthMode::None).await
+}
+
+/// Runs one BGP handshake over `stream` and checks what `peer show` reports.
+async fn complete_session_as(
+    bgp: &BgpService,
+    peer_address: &str,
+    stream: &mut TcpStream,
+    mode: PeerAuthMode,
+) -> Result<()> {
+    assert!(matches!(read_message(stream).await?, BgpMessage::Open(_)));
+    write_message(stream, &peer_open()).await?;
+    assert!(matches!(read_message(stream).await?, BgpMessage::KeepAlive));
+    write_message(stream, &BgpMessage::KeepAlive).await?;
+    assert!(
+        matches!(read_message(stream).await?, BgpMessage::Update(_)),
+        "{peer_address} did not get the establishment table"
+    );
+    assert!(ipv4_eor(&read_message(stream).await?));
+    let peer = bgp
+        .peer_show(peer_address)
+        .await
+        .context("the peer stays configured")?;
+    assert!(
+        matches!(peer.state, PeerState::Established),
+        "{peer_address}: {:?}",
+        peer.state
+    );
+    assert_eq!(peer.auth_mode, mode, "{peer_address}");
     Ok(())
 }
 
-/// TCP-AO (RFC 5925) on a passive session, for both RFC 5926 algorithms: the
 /// Skips an AO-dependent test when the kernel lacks TCP-AO, but refuses to skip
 /// when the run declares TCP-AO has to be exercised (`FOCL_REQUIRE_TCP_AO=1`,
 /// which CI sets): a green suite must not hide an untested path.
@@ -891,6 +937,7 @@ fn tcp_ao_or_skip(test: &str) -> bool {
     false
 }
 
+/// TCP-AO (RFC 5925) on a passive session, for both RFC 5926 algorithms: the
 /// listener holds the peer's key, so its signed SYN is accepted and the
 /// session runs over a TCP-AO protected connection.
 #[cfg(target_os = "linux")]

@@ -33,7 +33,7 @@ mod auth;
 /// TCP-MD5 (RFC 2385) and TCP-AO (RFC 5925) socket helpers. Re-exported so
 /// library users and the socket-level tests can authenticate a session against
 /// `focld` the same way the daemon does.
-pub use auth::{tcp_ao_supported, TcpAoStatus, TcpSocketExt, TcpStreamExt};
+pub use auth::{tcp_ao_probe, tcp_ao_supported, TcpAoStatus, TcpSocketExt, TcpStreamExt};
 
 const AS_TRANS: u16 = 23_456;
 
@@ -524,9 +524,12 @@ impl BgpService {
         // `FoclConfig::load` validates, but a config built in code arrives
         // unchecked, and `peer_auth` relies on a peer naming one mechanism.
         cfg.validate().context("invalid configuration")?;
-        let kernel_tcp_ao =
-            auth::tcp_ao_probe().context("could not tell whether the kernel implements TCP-AO")?;
-        require_tcp_ao_support(&cfg.peers, kernel_tcp_ao)?;
+        // Only a peer that authenticates with TCP-AO depends on the kernel
+        // option: a host that cannot answer the probe must not refuse a
+        // configuration that never asks for it.
+        if let Some(supported) = probe_kernel_tcp_ao(&cfg.peers, auth::tcp_ao_probe)? {
+            require_tcp_ao_support(&cfg.peers, supported)?;
+        }
         let router_id = cfg
             .global
             .router_id
@@ -2099,6 +2102,24 @@ fn peer_auth(peer: &PeerConfig) -> Option<PeerAuth<'_>> {
 /// (`supported`). Such a peer can never get a session, which would otherwise
 /// only show as a failing connect on every retry or a listener key the kernel
 /// refused. A disabled peer may keep its keys.
+/// Probes the kernel only when an enabled peer uses TCP-AO, and returns `None`
+/// when nothing needs the answer. A probe that fails is an error, never "the
+/// kernel has no TCP-AO".
+fn probe_kernel_tcp_ao(
+    peers: &[PeerConfig],
+    probe: impl FnOnce() -> std::io::Result<bool>,
+) -> Result<Option<bool>> {
+    if !peers
+        .iter()
+        .any(|peer| peer.enabled && !peer.tcp_ao_keys.is_empty())
+    {
+        return Ok(None);
+    }
+    Ok(Some(probe().context(
+        "could not tell whether the kernel implements TCP-AO",
+    )?))
+}
+
 fn require_tcp_ao_support(peers: &[PeerConfig], supported: bool) -> Result<()> {
     let needing: Vec<&str> = peers
         .iter()
@@ -2245,10 +2266,19 @@ fn listener_v6_only(fd: i32) -> bool {
                 &mut len,
             )
         };
-        result == 0 && value != 0
+        if result != 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "could not read IPV6_V6ONLY; assuming the listener takes IPv4 as v4-mapped"
+            );
+            return false;
+        }
+        value != 0
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // The kernel's authentication options bail out on non-Linux builds, so
+        // this only affects the unreachable-passive-peer report.
         let _ = fd;
         false
     }
@@ -2616,32 +2646,96 @@ mod tests {
         assert!(listener_auth_keys(&[]).is_empty());
     }
 
+    /// `listener_v6_only` reads the socket, so the test sets the option
+    /// explicitly: a host with `net.ipv6.bindv6only=1` must not change the
+    /// expected answer.
+    #[cfg(target_os = "linux")]
     #[test]
     fn v6_only_is_read_from_the_bound_socket() {
+        fn set_v6_only(socket: &TcpSocket, value: libc::c_int) {
+            // SAFETY: the option value outlives the call and matches IPV6_V6ONLY.
+            let rc = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_V6ONLY,
+                    &value as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "set IPV6_V6ONLY={value}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
         let dual = TcpSocket::new_v6().unwrap();
+        set_v6_only(&dual, 0);
         dual.bind("[::]:0".parse().unwrap()).unwrap();
-        assert!(!listener_v6_only(dual.as_raw_fd()), "dual-stack by default");
+        assert!(!listener_v6_only(dual.as_raw_fd()));
 
         let only = TcpSocket::new_v6().unwrap();
-        let one: libc::c_int = 1;
-        // SAFETY: the option value outlives the call and matches IPV6_V6ONLY.
-        let rc = unsafe {
-            libc::setsockopt(
-                only.as_raw_fd(),
-                libc::IPPROTO_IPV6,
-                libc::IPV6_V6ONLY,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(
-            rc,
-            0,
-            "set IPV6_V6ONLY: {}",
-            std::io::Error::last_os_error()
-        );
+        set_v6_only(&only, 1);
         only.bind("[::]:0".parse().unwrap()).unwrap();
         assert!(listener_v6_only(only.as_raw_fd()));
+    }
+
+    #[test]
+    fn the_tcp_ao_probe_runs_only_for_an_enabled_tcp_ao_peer() {
+        let ao_peer = |address: &str, enabled: bool| PeerConfig {
+            tcp_ao_keys: vec![TcpAoKeyConfig {
+                send_id: 1,
+                recv_id: 2,
+                algorithm: crate::config::TcpAoAlgorithm::HmacSha1_96,
+                secret: "ao-secret".to_string(),
+                current: false,
+            }],
+            ..md5_peer(address, enabled, None)
+        };
+
+        let mut called = false;
+        assert_eq!(
+            probe_kernel_tcp_ao(&[md5_peer("192.0.2.1", true, Some("md5"))], || {
+                called = true;
+                Ok(true)
+            })
+            .unwrap(),
+            None
+        );
+        assert!(!called, "a config without TCP-AO peers must not probe");
+
+        let mut called = false;
+        assert_eq!(
+            probe_kernel_tcp_ao(&[ao_peer("192.0.2.2", false)], || {
+                called = true;
+                Ok(true)
+            })
+            .unwrap(),
+            None
+        );
+        assert!(!called, "a disabled TCP-AO peer must not probe");
+
+        let mut called = false;
+        assert_eq!(
+            probe_kernel_tcp_ao(&[ao_peer("192.0.2.3", true)], || {
+                called = true;
+                Ok(true)
+            })
+            .unwrap(),
+            Some(true)
+        );
+        assert!(called);
+
+        let error = probe_kernel_tcp_ao(&[ao_peer("192.0.2.4", true)], || {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("could not tell whether the kernel implements TCP-AO"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -2666,11 +2760,16 @@ mod tests {
             "192.0.2.1:179".parse().unwrap(),
             "192.0.2.2:179".parse().unwrap(),
         ];
-        let error = bind_first_listener(addresses, |_| {
-            Err(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))
+        let error = bind_first_listener(addresses, |address| {
+            let kind = if address.ip().to_string() == "192.0.2.1" {
+                std::io::ErrorKind::AddrNotAvailable
+            } else {
+                std::io::ErrorKind::PermissionDenied
+            };
+            Err(std::io::Error::from(kind))
         })
         .expect_err("no address binds");
-        assert_eq!(error.kind(), std::io::ErrorKind::AddrNotAvailable);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

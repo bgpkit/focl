@@ -8,8 +8,9 @@ All notable changes to this project will be documented in this file.
 
 * **One peer per address** - configuration validation rejects two peers that name the same IP in different spellings (`192.0.2.1` and `::ffff:192.0.2.1`); one inbound connection could otherwise be assigned to either peer while only one of their keys was installed.
 * **Listener address fallback** - `focld` falls through to the next resolved `listen_addr` when a socket cannot be created for one address, as `TcpListener::bind` does, instead of aborting startup.
+* **Listener address family** - the listener reads `IPV6_V6ONLY` from the bound socket: with `bindv6only=1` an IPv4 passive peer is reported as unreachable in `focl peer show` instead of idling without a reason.
 * **Listener key failures stay visible** - a key that could not be installed on the listening socket is reported in `focl peer show` under `listener_key_error`, which later session errors or an established session do not clear.
-* **TCPAO counters** - the README explains the counters as the kernel counts them: an unsigned segment on a keyed listener lands in `TCPAORequired`, while an unsigned segment on a connection that requires TCP-AO lands in `TCPAOKeyNotFound`.
+* **TCPAO counters** - the README explains the counters as the kernel counts them: an unsigned segment at a socket that requires TCP-AO lands in `TCPAORequired`, while a segment carrying a TCP-AO option whose KeyID matches no installed key lands in `TCPAOKeyNotFound`.
 * **Inbound peer matching** - a peer configured as an IPv4-mapped literal (`::ffff:192.0.2.1`) matches its own inbound connection again: both the configured and the remote address are canonicalized before comparing.
 * **Listener key installation failures** - every key of a peer is attempted, and a peer whose listener key the kernel refused now carries that failure in `focl peer show` (`last_error`) instead of only in the startup log.
 * **Peer address validation** - a peer address must be a literal IP for every authentication mode, not only for TCP-AO, because the session path and the listener already require one.
