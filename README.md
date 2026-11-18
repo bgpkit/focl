@@ -238,9 +238,10 @@ nstat -az | grep -E 'TCPAO(Good|Bad|KeyNotFound|Required)'
 * `TCPAOKeyNotFound`: a segment carried a TCP-AO option whose KeyID matched no
   installed key, which includes a signed SYN from a peer the socket has no key
   for.
-* `TCPAORequired`: an unsigned segment reached a socket that requires TCP-AO:
-  a listener that holds a key for that peer, or a session we opened with
-  `ao_required`.
+* `TCPAORequired`: an unsigned segment reached a socket that requires TCP-AO.
+  That is a listener holding a key for the peer, a session we opened with
+  `ao_required`, or an accepted session whose keys were copied from such a
+  listener.
 
 ## Development
 

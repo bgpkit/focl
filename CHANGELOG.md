@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 
 * **One peer per address** - configuration validation rejects two peers that name the same IP in different spellings (`192.0.2.1` and `::ffff:192.0.2.1`); one inbound connection could otherwise be assigned to either peer while only one of their keys was installed.
 * **Listener address fallback** - `focld` falls through to the next resolved `listen_addr` when a socket cannot be created for one address, as `TcpListener::bind` does, instead of aborting startup.
-* **Listener address family** - the listener reads `IPV6_V6ONLY` from the bound socket: with `bindv6only=1` an IPv4 passive peer is reported as unreachable in `focl peer show` instead of idling without a reason.
+* **Listener address family** - on Linux the listener reads `IPV6_V6ONLY` from the bound socket: with `bindv6only=1` an IPv4 passive peer is reported as unreachable in `focl peer show` instead of idling without a reason. Other platforms keep the previous dual-stack assumption, and their kernel authentication options bail out anyway.
 * **Listener key failures stay visible** - a key that could not be installed on the listening socket is reported in `focl peer show` under `listener_key_error`, which later session errors or an established session do not clear.
 * **TCPAO counters** - the README explains the counters as the kernel counts them: an unsigned segment at a socket that requires TCP-AO lands in `TCPAORequired`, while a segment carrying a TCP-AO option whose KeyID matches no installed key lands in `TCPAOKeyNotFound`.
 * **Inbound peer matching** - a peer configured as an IPv4-mapped literal (`::ffff:192.0.2.1`) matches its own inbound connection again: both the configured and the remote address are canonicalized before comparing.
@@ -25,7 +25,7 @@ All notable changes to this project will be documented in this file.
 * **RFC 2918 route refresh replay** - a received ROUTE-REFRESH for a negotiated family re-sends that family's Adj-RIB-Out followed by its End-of-RIB (the hold timer reset is unchanged); a refresh for a family the session does not carry is ignored, and the RFC 7313 BoRR/EoRR subtypes are not implemented.
 * **End-of-RIB for a capability-less peer** - the IPv4 End-of-RIB decision now agrees with the announcement decision, so a plain RFC 4271 peer that negotiated no capabilities gets its IPv4 marker.
 * **One initial table send** - the establishment table is sent exactly once, inside the registration critical section, with the End-of-RIB markers after it; the previous pre-lock send re-sent every copy after the EoR and archived it twice.
-* The TCP-MD5 and TCP-AO socket helpers are re-exported as `focl::bgp::{TcpSocketExt, TcpStreamExt, TcpAoStatus, tcp_ao_supported}`.
+* The TCP-MD5 and TCP-AO socket helpers are re-exported as `focl::bgp::{TcpSocketExt, TcpStreamExt, TcpAoStatus, tcp_ao_supported, tcp_ao_probe}`; `tcp_ao_supported` reports a failed probe as "no TCP-AO", while `tcp_ao_probe` returns the error.
 
 ### New features
 

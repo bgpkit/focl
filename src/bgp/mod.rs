@@ -561,17 +561,25 @@ impl BgpService {
 
     async fn start_peers(&self, peers: &[PeerConfig]) {
         for peer in peers.iter().filter(|peer| peer.enabled) {
-            let runtime = self.make_runtime(peer.clone());
             self.inner
                 .rib_in
                 .write()
                 .await
                 .insert(peer.address.clone(), IpnetTrie::new());
-            self.inner
-                .peers
-                .write()
-                .await
-                .insert(peer.address.clone(), runtime);
+        }
+        // Register every peer before spawning its loop: an active peer reports
+        // its first state as soon as the task runs, and a write that arrives
+        // before the peer is in the map is dropped. The map stays locked across
+        // the spawn, so that first write waits for the registration.
+        let mut runtime_peers = self.inner.peers.write().await;
+        for peer in peers.iter().filter(|peer| peer.enabled) {
+            runtime_peers.insert(peer.address.clone(), self.make_runtime(peer.clone()));
+            if !peer.passive {
+                let task = self.spawn_active_loop(peer.clone());
+                if let Some(runtime) = runtime_peers.get_mut(&peer.address) {
+                    runtime.task = Some(task);
+                }
+            }
         }
     }
 
@@ -597,11 +605,10 @@ impl BgpService {
             advertised_prefixes: 0,
             established_at: None,
         };
-        let task = (!peer_cfg.passive).then(|| self.spawn_active_loop(peer_cfg.clone()));
         PeerRuntime {
             info,
             cfg: peer_cfg,
-            task,
+            task: None,
             remote_bgp_id: None,
         }
     }
@@ -2105,10 +2112,6 @@ fn peer_auth(peer: &PeerConfig) -> Option<PeerAuth<'_>> {
     peer.password.as_deref().map(PeerAuth::Md5)
 }
 
-/// Fails when an enabled peer has TCP-AO keys and the kernel has no TCP-AO
-/// (`supported`). Such a peer can never get a session, which would otherwise
-/// only show as a failing connect on every retry or a listener key the kernel
-/// refused. A disabled peer may keep its keys.
 /// Probes the kernel only when an enabled peer uses TCP-AO, and returns `None`
 /// when nothing needs the answer. A probe that fails is an error, never "the
 /// kernel has no TCP-AO".
@@ -2127,6 +2130,10 @@ fn probe_kernel_tcp_ao(
     )?))
 }
 
+/// Fails when an enabled peer has TCP-AO keys and the kernel has no TCP-AO
+/// (`supported`). Such a peer can never get a session, which would otherwise
+/// only show as a failing connect on every retry or a listener key the kernel
+/// refused. A disabled peer may keep its keys.
 fn require_tcp_ao_support(peers: &[PeerConfig], supported: bool) -> Result<()> {
     let needing: Vec<&str> = peers
         .iter()
@@ -2687,6 +2694,53 @@ mod tests {
         set_v6_only(&only, 1);
         only.bind("[::]:0".parse().unwrap()).unwrap();
         assert!(listener_v6_only(only.as_raw_fd()));
+    }
+
+    /// An active peer reports its first state as soon as its loop runs. If the
+    /// loop is spawned before the peer is registered, that write is dropped and
+    /// the peer never reports `Connect`, which is what `start_peers` used to do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_active_peer_reports_its_first_state() {
+        let mut cfg = test_service_config();
+        cfg.peers = (1..=40)
+            .map(|i| PeerConfig {
+                address: format!("127.0.1.{i}"),
+                remote_as: 65_002,
+                local_as: None,
+                hold_time_secs: 90,
+                connect_retry_secs: 30,
+                remote_port: 1,
+                local_address: None,
+                enabled: true,
+                passive: false,
+                route_refresh: false,
+                name: None,
+                password: None,
+                tcp_ao_keys: vec![],
+            })
+            .collect();
+        let (event_tx, mut event_rx) = broadcast::channel(4096);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut connects: HashSet<String> = HashSet::new();
+        while let Ok(envelope) = event_rx.try_recv() {
+            if let Event::PeerState {
+                peer,
+                state: PeerState::Connect,
+            } = envelope.event
+            {
+                connects.insert(peer);
+            }
+        }
+        for i in 1..=40 {
+            let address = format!("127.0.1.{i}");
+            assert!(
+                connects.contains(&address),
+                "{address} never reported its first state"
+            );
+        }
+        drop(service);
     }
 
     #[test]
