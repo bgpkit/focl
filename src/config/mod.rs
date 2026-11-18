@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -36,7 +37,20 @@ impl FoclConfig {
             bail!("[global].router_id must be a valid IPv4 address");
         }
 
+        // One peer per address: an inbound connection matches a peer by IP, so
+        // two spellings of the same address (`192.0.2.1` and `::ffff:192.0.2.1`)
+        // would leave the choice of peer, its remote AS and its key undefined.
+        let mut seen: std::collections::HashMap<std::net::IpAddr, &str> =
+            std::collections::HashMap::new();
         for peer in &self.peers {
+            if let Ok(address) = peer.address.parse::<std::net::IpAddr>() {
+                if let Some(first) = seen.insert(address.to_canonical(), peer.address.as_str()) {
+                    bail!(
+                        "peers {first} and {} are the same address in different spellings",
+                        peer.address
+                    );
+                }
+            }
             if peer.remote_as == 0 {
                 bail!("peer {} has invalid remote_as 0", peer.address);
             }
@@ -61,6 +75,7 @@ impl FoclConfig {
                     );
                 }
             }
+            validate_peer_auth(peer)?;
         }
 
         for prefix in &self.prefixes {
@@ -111,7 +126,11 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One `[[peers]]` table. An unknown key is an error: a misspelled `password`
+/// or `tcp_ao_keys` would otherwise leave the peer without the authentication
+/// its config asks for.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     pub address: String,
     pub remote_as: u32,
@@ -133,8 +152,168 @@ pub struct PeerConfig {
     pub route_refresh: bool,
     #[serde(default)]
     pub name: Option<String>,
+    /// TCP-MD5 (RFC 2385) password. Mutually exclusive with `tcp_ao_keys`.
     #[serde(default)]
     pub password: Option<String>,
+    /// TCP-AO (RFC 5925) master key tuples. Mutually exclusive with
+    /// `password`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp_ao_keys: Vec<TcpAoKeyConfig>,
+}
+
+/// Stands in for a secret in `Debug` output.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Leaves the TCP-MD5 password out, so a peer can end up in a log or a panic
+/// message. The destructuring makes a new field a compile error here rather
+/// than a field that silently goes unprinted.
+impl fmt::Debug for PeerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            address,
+            remote_as,
+            local_as,
+            hold_time_secs,
+            connect_retry_secs,
+            remote_port,
+            local_address,
+            enabled,
+            passive,
+            route_refresh,
+            name,
+            password,
+            tcp_ao_keys,
+        } = self;
+        f.debug_struct("PeerConfig")
+            .field("address", address)
+            .field("remote_as", remote_as)
+            .field("local_as", local_as)
+            .field("hold_time_secs", hold_time_secs)
+            .field("connect_retry_secs", connect_retry_secs)
+            .field("remote_port", remote_port)
+            .field("local_address", local_address)
+            .field("enabled", enabled)
+            .field("passive", passive)
+            .field("route_refresh", route_refresh)
+            .field("name", name)
+            .field("password", &password.as_ref().map(|_| Redacted))
+            .field("tcp_ao_keys", tcp_ao_keys)
+            .finish()
+    }
+}
+
+/// The longest TCP-MD5 password or TCP-AO secret the Linux kernel accepts.
+pub const TCP_AUTH_MAX_KEY_LEN: usize = 80;
+
+/// One TCP-AO master key tuple (RFC 5925 s3.1). `send_id` goes into the KeyID
+/// of outgoing segments and has to equal the peer's `recv_id`, and vice versa.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpAoKeyConfig {
+    pub send_id: u8,
+    pub recv_id: u8,
+    pub algorithm: TcpAoAlgorithm,
+    pub secret: String,
+    /// On a connection focl opens: sign outgoing segments with this key and
+    /// ask the peer to do the same, the first key when no key sets it. On a
+    /// connection the peer opens its SYN picks both keys, and this only
+    /// decides whether focl warns about the ones it picked.
+    #[serde(default)]
+    pub current: bool,
+}
+
+/// Leaves the secret out, so a key can end up in a log or a panic message.
+impl fmt::Debug for TcpAoKeyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            send_id,
+            recv_id,
+            algorithm,
+            secret: _,
+            current,
+        } = self;
+        f.debug_struct("TcpAoKeyConfig")
+            .field("send_id", send_id)
+            .field("recv_id", recv_id)
+            .field("algorithm", algorithm)
+            .field("secret", &Redacted)
+            .field("current", current)
+            .finish()
+    }
+}
+
+/// The RFC 5926 MAC algorithms, both with a 96-bit MAC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TcpAoAlgorithm {
+    #[serde(rename = "hmac-sha1-96")]
+    HmacSha1_96,
+    #[serde(rename = "aes-128-cmac-96")]
+    Aes128Cmac96,
+}
+
+fn validate_peer_auth(peer: &PeerConfig) -> Result<()> {
+    if let Some(password) = &peer.password {
+        if password.is_empty() || password.len() > TCP_AUTH_MAX_KEY_LEN {
+            bail!(
+                "peer {} has an invalid password; must be 1-{TCP_AUTH_MAX_KEY_LEN} bytes",
+                peer.address
+            );
+        }
+    }
+    // Sessions are keyed by a literal address: the active path parses the peer
+    // address, the listener matches inbound connections against it, and both
+    // kernel authentication options are keyed by address.
+    if peer.address.parse::<std::net::IpAddr>().is_err() {
+        bail!("peer {} needs a literal IP address", peer.address);
+    }
+    if peer.tcp_ao_keys.is_empty() {
+        return Ok(());
+    }
+    if peer.password.is_some() {
+        bail!(
+            "peer {} sets both password (TCP-MD5) and tcp_ao_keys (TCP-AO); pick one",
+            peer.address
+        );
+    }
+    let mut send_ids = std::collections::HashSet::new();
+    let mut recv_ids = std::collections::HashSet::new();
+    for key in &peer.tcp_ao_keys {
+        if key.secret.is_empty() || key.secret.len() > TCP_AUTH_MAX_KEY_LEN {
+            bail!(
+                "peer {} has a TCP-AO key (send_id {}) with an invalid secret; must be 1-{TCP_AUTH_MAX_KEY_LEN} bytes",
+                peer.address,
+                key.send_id
+            );
+        }
+        // RFC 5925 s3.1: a KeyID has to identify a single MKT per direction.
+        if !send_ids.insert(key.send_id) {
+            bail!(
+                "peer {} has duplicate TCP-AO send_id {}",
+                peer.address,
+                key.send_id
+            );
+        }
+        if !recv_ids.insert(key.recv_id) {
+            bail!(
+                "peer {} has duplicate TCP-AO recv_id {}",
+                peer.address,
+                key.recv_id
+            );
+        }
+    }
+    if peer.tcp_ao_keys.iter().filter(|key| key.current).count() > 1 {
+        bail!(
+            "peer {} marks more than one TCP-AO key as current",
+            peer.address
+        );
+    }
+    Ok(())
 }
 
 fn default_true() -> bool {
@@ -405,7 +584,7 @@ pub enum RibSource {
     LocRib,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ArchiveDestinationConfig {
     #[serde(rename = "type")]
     pub destination_type: DestinationType,
@@ -428,12 +607,61 @@ pub struct ArchiveDestinationConfig {
     pub max_retries: Option<u32>,
     #[serde(default)]
     pub region: Option<String>,
+    // TODO: deprecate `access_key_id`, `secret_access_key` and
+    // `session_token`. Nothing has ever read them: the replicator builds its
+    // S3 client from the default AWS credential chain (environment, profile,
+    // instance role), so setting them here has no effect. Warn at load when
+    // one is set, then drop them.
     #[serde(default)]
     pub access_key_id: Option<String>,
     #[serde(default)]
     pub secret_access_key: Option<String>,
     #[serde(default)]
     pub session_token: Option<String>,
+}
+
+/// Leaves the S3 secret access key and session token out, so a destination
+/// can end up in a log or a panic message. The access key id stays: it names
+/// the credential in use and is no secret, as every signed request carries it
+/// in clear.
+impl fmt::Debug for ArchiveDestinationConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            destination_type,
+            mode,
+            path,
+            required,
+            endpoint,
+            bucket,
+            prefix,
+            upload_concurrency,
+            retry_backoff_secs,
+            max_retries,
+            region,
+            access_key_id,
+            secret_access_key,
+            session_token,
+        } = self;
+        f.debug_struct("ArchiveDestinationConfig")
+            .field("destination_type", destination_type)
+            .field("mode", mode)
+            .field("path", path)
+            .field("required", required)
+            .field("endpoint", endpoint)
+            .field("bucket", bucket)
+            .field("prefix", prefix)
+            .field("upload_concurrency", upload_concurrency)
+            .field("retry_backoff_secs", retry_backoff_secs)
+            .field("max_retries", max_retries)
+            .field("region", region)
+            .field("access_key_id", access_key_id)
+            .field(
+                "secret_access_key",
+                &secret_access_key.as_ref().map(|_| Redacted),
+            )
+            .field("session_token", &session_token.as_ref().map(|_| Redacted))
+            .finish()
+    }
 }
 
 impl ArchiveDestinationConfig {
@@ -629,5 +857,231 @@ dev_attr255_interval_secs = 0
             ribs: "{collector}/{yyyy}/ribs.{yyyymmdd}.{hhmm}.{ext}".to_string(),
         };
         templates.validate().expect("safe template should validate");
+    }
+
+    const TCP_AO_PEER: &str = r#"
+[global]
+asn = 65001
+router_id = "192.0.2.1"
+
+[[peers]]
+address = "192.0.2.2"
+remote_as = 65002
+
+[[peers.tcp_ao_keys]]
+send_id = 1
+recv_id = 2
+algorithm = "hmac-sha1-96"
+secret = "first"
+
+[[peers.tcp_ao_keys]]
+send_id = 3
+recv_id = 4
+algorithm = "aes-128-cmac-96"
+secret = "second"
+current = true
+"#;
+
+    fn tcp_ao_config() -> FoclConfig {
+        toml::from_str(TCP_AO_PEER).expect("toml should parse")
+    }
+
+    fn validation_error(cfg: &FoclConfig) -> String {
+        cfg.validate()
+            .expect_err("config should be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn parses_and_roundtrips_tcp_ao_keys() {
+        let cfg = tcp_ao_config();
+        cfg.validate().expect("TCP-AO peer should validate");
+        let keys = &cfg.peers[0].tcp_ao_keys;
+        assert_eq!(
+            keys[0],
+            TcpAoKeyConfig {
+                send_id: 1,
+                recv_id: 2,
+                algorithm: TcpAoAlgorithm::HmacSha1_96,
+                secret: "first".to_string(),
+                current: false,
+            }
+        );
+        assert_eq!(keys[1].algorithm, TcpAoAlgorithm::Aes128Cmac96);
+        assert!(keys[1].current);
+
+        let encoded = toml::to_string(&cfg).expect("config should serialize");
+        let reparsed: FoclConfig = toml::from_str(&encoded).expect("roundtrip should parse");
+        assert_eq!(reparsed.peers[0].tcp_ao_keys, *keys);
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_tcp_ao_secret() {
+        let cfg = tcp_ao_config();
+        let printed = format!("{:?}", cfg.peers[0]);
+        assert!(printed.contains("send_id: 1"), "{printed}");
+        assert!(printed.contains("secret: <redacted>"), "{printed}");
+        assert!(!printed.contains("first"), "{printed}");
+        assert!(!printed.contains("second"), "{printed}");
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_md5_password() {
+        let mut cfg = tcp_ao_config();
+        let peer = &mut cfg.peers[0];
+        peer.tcp_ao_keys.clear();
+        assert!(format!("{peer:?}").contains("password: None"));
+
+        peer.password = Some("md5-password".to_string());
+        let printed = format!("{cfg:?}");
+        assert!(printed.contains("address: \"192.0.2.2\""), "{printed}");
+        assert!(printed.contains("password: Some(<redacted>)"), "{printed}");
+        assert!(!printed.contains("md5-password"), "{printed}");
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_s3_secrets() {
+        let mut cfg = tcp_ao_config();
+        let destination = &mut cfg.archive.destinations[0];
+        assert!(format!("{destination:?}").contains("secret_access_key: None"));
+
+        destination.access_key_id = Some("AKIDEXAMPLE".to_string());
+        destination.secret_access_key = Some("s3-secret".to_string());
+        destination.session_token = Some("s3-token".to_string());
+        let printed = format!("{cfg:?}");
+        assert!(
+            printed.contains("access_key_id: Some(\"AKIDEXAMPLE\")"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("secret_access_key: Some(<redacted>)"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("session_token: Some(<redacted>)"),
+            "{printed}"
+        );
+        assert!(!printed.contains("s3-secret"), "{printed}");
+        assert!(!printed.contains("s3-token"), "{printed}");
+    }
+
+    #[test]
+    fn rejects_unknown_tcp_ao_algorithm() {
+        let raw = TCP_AO_PEER.replace("aes-128-cmac-96", "hmac-md5");
+        assert!(toml::from_str::<FoclConfig>(&raw).is_err());
+    }
+
+    /// A typo must not quietly drop a key's `current` mark, or the keys
+    /// (and with them the peer's authentication) altogether.
+    #[test]
+    fn rejects_unknown_peer_and_tcp_ao_key_fields() {
+        let parse_error = |raw: &str| {
+            toml::from_str::<FoclConfig>(raw)
+                .expect_err("an unknown field should be rejected")
+                .to_string()
+        };
+
+        let error = parse_error(&TCP_AO_PEER.replace("current = true", "currnet = true"));
+        assert!(error.contains("unknown field `currnet`"), "{error}");
+
+        let error =
+            parse_error(&TCP_AO_PEER.replace("[[peers.tcp_ao_keys]]", "[[peers.tcp_ao_key]]"));
+        assert!(error.contains("unknown field `tcp_ao_key`"), "{error}");
+
+        let error = parse_error(
+            &TCP_AO_PEER.replace("remote_as = 65002", "remote_as = 65002\npasswrod = \"md5\""),
+        );
+        assert!(error.contains("unknown field `passwrod`"), "{error}");
+    }
+
+    #[test]
+    fn shipped_example_configs_still_parse_and_validate() {
+        for (name, raw) in [
+            ("focl.toml", include_str!("../../focl.toml")),
+            (
+                "focl-vultr-example.toml",
+                include_str!("../../focl-vultr-example.toml"),
+            ),
+            (
+                "scripts/interop/focl-interop.toml",
+                include_str!("../../scripts/interop/focl-interop.toml"),
+            ),
+            (
+                "scripts/interop/focl-interop-md5.toml",
+                include_str!("../../scripts/interop/focl-interop-md5.toml"),
+            ),
+        ] {
+            let cfg: FoclConfig =
+                toml::from_str(raw).unwrap_or_else(|error| panic!("{name}: {error}"));
+            cfg.validate()
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn rejects_password_together_with_tcp_ao_keys() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].password = Some("md5".to_string());
+        assert!(validation_error(&cfg).contains("pick one"));
+    }
+
+    #[test]
+    fn rejects_a_hostname_peer() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].address = "router.example".to_string();
+        assert!(validation_error(&cfg).contains("literal IP address"));
+
+        // The same rule applies to a peer with no authentication at all.
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys.clear();
+        cfg.peers[0].address = "router.example".to_string();
+        assert!(validation_error(&cfg).contains("literal IP address"));
+    }
+
+    #[test]
+    fn rejects_two_spellings_of_one_peer_address() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].address = "192.0.2.1".to_string();
+        let mut alias = cfg.peers[0].clone();
+        alias.address = "::ffff:192.0.2.1".to_string();
+        cfg.peers.push(alias);
+        assert!(validation_error(&cfg).contains("same address in different spellings"));
+    }
+
+    #[test]
+    fn rejects_duplicate_tcp_ao_key_ids() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys[1].send_id = 1;
+        assert!(validation_error(&cfg).contains("duplicate TCP-AO send_id 1"));
+
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys[1].recv_id = 2;
+        assert!(validation_error(&cfg).contains("duplicate TCP-AO recv_id 2"));
+    }
+
+    #[test]
+    fn rejects_more_than_one_current_tcp_ao_key() {
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys[0].current = true;
+        assert!(validation_error(&cfg).contains("more than one TCP-AO key as current"));
+    }
+
+    #[test]
+    fn rejects_empty_or_oversized_secrets_and_passwords() {
+        for secret in [String::new(), "x".repeat(TCP_AUTH_MAX_KEY_LEN + 1)] {
+            let mut cfg = tcp_ao_config();
+            cfg.peers[0].tcp_ao_keys[0].secret = secret.clone();
+            assert!(validation_error(&cfg).contains("invalid secret"));
+
+            let mut cfg = tcp_ao_config();
+            cfg.peers[0].tcp_ao_keys.clear();
+            cfg.peers[0].password = Some(secret);
+            assert!(validation_error(&cfg).contains("invalid password"));
+        }
+
+        let mut cfg = tcp_ao_config();
+        cfg.peers[0].tcp_ao_keys[0].secret = "x".repeat(TCP_AUTH_MAX_KEY_LEN);
+        cfg.validate()
+            .expect("an 80-byte secret is the kernel maximum");
     }
 }

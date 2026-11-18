@@ -15,9 +15,14 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use focl::archive::types::ArchiveStream;
 use focl::archive::ArchiveService;
-use focl::bgp::{BgpService, PrefixSource, PrefixStatus, TcpSocketExt};
-use focl::config::{ArchiveConfig, FoclConfig, GlobalConfig, PeerConfig, PrefixConfig};
-use focl::types::{Event, PeerState};
+use focl::bgp::{
+    tcp_ao_supported, BgpService, PrefixSource, PrefixStatus, TcpSocketExt, TcpStreamExt,
+};
+use focl::config::{
+    ArchiveConfig, FoclConfig, GlobalConfig, PeerConfig, PrefixConfig, TcpAoAlgorithm,
+    TcpAoKeyConfig,
+};
+use focl::types::{Event, PeerAuthMode, PeerState};
 use ipnet::IpNet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
@@ -26,8 +31,14 @@ use tokio::time::timeout;
 
 const PEER_AS: u32 = 65_002;
 const FOCL_AS: u32 = 65_001;
-/// The TCP-MD5 password of the passive peer in the MD5 acceptance test.
+/// The TCP-MD5 password of the peer in the MD5 acceptance tests.
 const MD5_PASSWORD: &str = "focl-md5-acceptance";
+/// The TCP-AO secret of the peer in the TCP-AO acceptance tests.
+const AO_SECRET: &str = "focl-tcp-ao-acceptance";
+/// TCP-AO KeyIDs: focld's SendID is the peer's RecvID and vice versa. They
+/// differ so a swapped direction cannot pass.
+const FOCL_AO_SEND_ID: u8 = 1;
+const PEER_AO_SEND_ID: u8 = 2;
 /// The IPv6 prefix carrying the attribute-255 clock in the clock tests.
 const CLOCK_PREFIX: &str = "2001:db8:feed::/48";
 
@@ -59,6 +70,7 @@ async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()
             route_refresh: true,
             name: None,
             password: None,
+            tcp_ao_keys: vec![],
         }],
         prefixes: vec![
             PrefixConfig {
@@ -227,6 +239,7 @@ async fn rib_snapshot_carries_the_live_adj_rib_in() -> Result<()> {
             route_refresh: true,
             name: None,
             password: None,
+            tcp_ao_keys: vec![],
         }],
         prefixes: vec![],
         archive: ArchiveConfig {
@@ -356,6 +369,7 @@ async fn session_end_archives_the_established_to_active_transition() -> Result<(
             route_refresh: true,
             name: None,
             password: None,
+            tcp_ao_keys: vec![],
         }],
         prefixes: vec![],
         archive: ArchiveConfig {
@@ -448,29 +462,60 @@ async fn service_with_peer(
     password: Option<&str>,
     hold_time_secs: u16,
 ) -> Result<BgpService> {
+    let mut peer = test_peer(port, hold_time_secs);
+    peer.password = password.map(str::to_string);
+    let listen_addr = format!("127.0.0.1:{port}");
+    start_service(temp, prefixes, peer, Some(&listen_addr)).await
+}
+
+/// A passive peer at 127.0.0.1, whose remote port (used when it is made
+/// active) is `port`.
+fn test_peer(port: u16, hold_time_secs: u16) -> PeerConfig {
+    PeerConfig {
+        address: "127.0.0.1".to_string(),
+        remote_as: PEER_AS,
+        local_as: None,
+        hold_time_secs,
+        connect_retry_secs: 1,
+        remote_port: port,
+        local_address: None,
+        enabled: true,
+        passive: true,
+        route_refresh: true,
+        name: None,
+        password: None,
+        tcp_ao_keys: vec![],
+    }
+}
+
+/// Starts focld with `peer`, listening on `listen_addr` if given.
+async fn start_service(
+    temp: &tempfile::TempDir,
+    prefixes: Vec<PrefixConfig>,
+    peer: PeerConfig,
+    listen_addr: Option<&str>,
+) -> Result<BgpService> {
+    start_service_with_peers(temp, prefixes, vec![peer], listen_addr).await
+}
+
+/// Starts focld with several peers on one service, for cases where more than
+/// one peer shares the listener.
+async fn start_service_with_peers(
+    temp: &tempfile::TempDir,
+    prefixes: Vec<PrefixConfig>,
+    peers: Vec<PeerConfig>,
+    listen_addr: Option<&str>,
+) -> Result<BgpService> {
     let cfg = FoclConfig {
         global: GlobalConfig {
             asn: FOCL_AS,
             router_id: "192.0.2.1".to_string(),
-            listen: true,
-            listen_addr: format!("127.0.0.1:{port}"),
+            listen: listen_addr.is_some(),
+            listen_addr: listen_addr.unwrap_or("127.0.0.1:0").to_string(),
             control_socket: temp.path().join("focld.sock"),
             log_level: "warn".to_string(),
         },
-        peers: vec![PeerConfig {
-            address: "127.0.0.1".to_string(),
-            remote_as: PEER_AS,
-            local_as: None,
-            hold_time_secs,
-            connect_retry_secs: 1,
-            remote_port: port,
-            local_address: None,
-            enabled: true,
-            passive: true,
-            route_refresh: true,
-            name: None,
-            password: password.map(str::to_string),
-        }],
+        peers,
         prefixes,
         archive: ArchiveConfig {
             enabled: false,
@@ -673,6 +718,455 @@ async fn passive_session_with_md5_completes_the_handshake() -> Result<()> {
         .await
         .context("peer stays configured")?;
     assert!(matches!(peer.state, PeerState::Established));
+    Ok(())
+}
+
+/// focld's TCP-AO keys for the peer at 127.0.0.1.
+fn focl_ao_keys(algorithm: TcpAoAlgorithm) -> Vec<TcpAoKeyConfig> {
+    vec![TcpAoKeyConfig {
+        send_id: FOCL_AO_SEND_ID,
+        recv_id: PEER_AO_SEND_ID,
+        algorithm,
+        secret: AO_SECRET.to_string(),
+        current: false,
+    }]
+}
+
+/// The peer's side of [`focl_ao_keys`], signing with `secret`.
+fn peer_ao_keys(algorithm: TcpAoAlgorithm, secret: &str) -> Vec<TcpAoKeyConfig> {
+    vec![TcpAoKeyConfig {
+        send_id: PEER_AO_SEND_ID,
+        recv_id: FOCL_AO_SEND_ID,
+        algorithm,
+        secret: secret.to_string(),
+        current: false,
+    }]
+}
+
+fn focl_v4_prefix() -> Vec<PrefixConfig> {
+    vec![PrefixConfig {
+        network: "198.51.100.0/24".to_string(),
+        next_hop: Some("192.0.2.1".to_string()),
+        dev_attr255_interval_secs: None,
+    }]
+}
+
+/// Plays the peer through OPEN/KEEPALIVE and the initial table on a
+/// connection focld already sent its OPEN on, and checks that focld reports
+/// the session Established with `auth_mode`.
+async fn complete_authenticated_session(
+    bgp: &BgpService,
+    stream: &mut TcpStream,
+    auth_mode: PeerAuthMode,
+) -> Result<()> {
+    assert!(matches!(read_message(stream).await?, BgpMessage::Open(_)));
+    write_message(stream, &peer_open()).await?;
+    assert!(matches!(read_message(stream).await?, BgpMessage::KeepAlive));
+    write_message(stream, &BgpMessage::KeepAlive).await?;
+
+    let announcement = read_message(stream).await?;
+    assert!(
+        has_focl_v4(&announcement),
+        "expected the configured table over the authenticated session, got {announcement:?}"
+    );
+    assert!(ipv4_eor(&read_message(stream).await?));
+    let peer = bgp
+        .peer_show("127.0.0.1")
+        .await
+        .context("peer stays configured")?;
+    assert!(matches!(peer.state, PeerState::Established));
+    assert_eq!(peer.auth_mode, auth_mode);
+    assert!(peer.auth_enabled);
+    Ok(())
+}
+
+/// The peer's view of a TCP-AO session: signed with its own SendID, asking
+/// focld for focld's, and every segment so far verified.
+fn assert_peer_side_tcp_ao(stream: &TcpStream) -> Result<()> {
+    let status = stream
+        .tcp_ao_status()?
+        .context("the session is not TCP-AO protected")?;
+    assert_eq!(status.current_key, PEER_AO_SEND_ID);
+    assert_eq!(status.rnext_key, FOCL_AO_SEND_ID);
+    assert!(status.pkt_good > 0, "no verified segments: {status:?}");
+    assert_eq!(
+        status.pkt_bad, 0,
+        "segments failed verification: {status:?}"
+    );
+    Ok(())
+}
+
+/// Whether focld sends its OPEN on a connection from `socket`: false when
+/// the connect or the OPEN does not arrive in time. The kernel silently drops
+/// a SYN that fails authentication, so a refused peer just times out.
+async fn receives_open(socket: TcpSocket, remote: SocketAddr) -> bool {
+    let Ok(Ok(mut stream)) = timeout(Duration::from_secs(2), socket.connect(remote)).await else {
+        return false;
+    };
+    matches!(
+        timeout(Duration::from_secs(2), read_message(&mut stream)).await,
+        Ok(Ok(BgpMessage::Open(_)))
+    )
+}
+
+/// Round 1 left one case open: a single listener must serve a keyed peer and a
+/// peer with no authentication at the same time. The listener holds the keyed
+/// peer's key without requiring TCP-AO for everyone, and the unkeyed peer's
+/// session is not treated as authenticated.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn one_listener_serves_a_keyed_and_an_unkeyed_peer() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+
+    let mut keyed = test_peer(port, 30);
+    keyed.address = "127.0.0.2".to_string();
+    keyed.password = Some(MD5_PASSWORD.to_string());
+    let mut plain = test_peer(port, 30);
+    plain.address = "127.0.0.3".to_string();
+
+    let bgp = start_service_with_peers(
+        &temp,
+        focl_v4_prefix(),
+        vec![keyed, plain],
+        Some(&format!("127.0.0.1:{port}")),
+    )
+    .await?;
+
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+
+    // The keyed peer installs its key before the SYN, like a router would.
+    let keyed_socket = TcpSocket::new_v4()?;
+    keyed_socket.bind(SocketAddr::from(([127, 0, 0, 2], 0)))?;
+    keyed_socket
+        .set_md5_signature(&remote, MD5_PASSWORD)
+        .context("installing the peer-side TCP-MD5 key (needs CAP_NET_ADMIN)")?;
+    let mut keyed_stream = timeout(Duration::from_secs(5), keyed_socket.connect(remote)).await??;
+
+    let plain_socket = TcpSocket::new_v4()?;
+    plain_socket.bind(SocketAddr::from(([127, 0, 0, 3], 0)))?;
+    let mut plain_stream = timeout(Duration::from_secs(5), plain_socket.connect(remote)).await??;
+
+    complete_session_as(&bgp, "127.0.0.2", &mut keyed_stream, PeerAuthMode::Md5).await?;
+    complete_session_as(&bgp, "127.0.0.3", &mut plain_stream, PeerAuthMode::None).await
+}
+
+/// The same listener case with TCP-AO: the listener holds the AO peer's key
+/// without setting `ao_required`, so an unauthenticated peer on the same socket
+/// still gets its session.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn one_listener_serves_an_ao_and_an_unkeyed_peer() -> Result<()> {
+    if !tcp_ao_or_skip("one_listener_serves_an_ao_and_an_unkeyed_peer") {
+        return Ok(());
+    }
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+
+    let algorithm = TcpAoAlgorithm::HmacSha1_96;
+    let mut keyed = test_peer(port, 30);
+    keyed.address = "127.0.0.2".to_string();
+    keyed.tcp_ao_keys = focl_ao_keys(algorithm);
+    let mut plain = test_peer(port, 30);
+    plain.address = "127.0.0.3".to_string();
+
+    let bgp = start_service_with_peers(
+        &temp,
+        focl_v4_prefix(),
+        vec![keyed, plain],
+        Some(&format!("127.0.0.1:{port}")),
+    )
+    .await?;
+
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+    let keyed_socket = TcpSocket::new_v4()?;
+    keyed_socket.bind(SocketAddr::from(([127, 0, 0, 2], 0)))?;
+    keyed_socket.set_tcp_ao_keys(&remote, &peer_ao_keys(algorithm, AO_SECRET))?;
+    let mut keyed_stream = timeout(Duration::from_secs(5), keyed_socket.connect(remote)).await??;
+
+    let plain_socket = TcpSocket::new_v4()?;
+    plain_socket.bind(SocketAddr::from(([127, 0, 0, 3], 0)))?;
+    let mut plain_stream = timeout(Duration::from_secs(5), plain_socket.connect(remote)).await??;
+
+    complete_session_as(&bgp, "127.0.0.2", &mut keyed_stream, PeerAuthMode::TcpAo).await?;
+    complete_session_as(&bgp, "127.0.0.3", &mut plain_stream, PeerAuthMode::None).await
+}
+
+/// Runs one BGP handshake over `stream` and checks what `peer show` reports.
+async fn complete_session_as(
+    bgp: &BgpService,
+    peer_address: &str,
+    stream: &mut TcpStream,
+    mode: PeerAuthMode,
+) -> Result<()> {
+    assert!(matches!(read_message(stream).await?, BgpMessage::Open(_)));
+    write_message(stream, &peer_open()).await?;
+    assert!(matches!(read_message(stream).await?, BgpMessage::KeepAlive));
+    write_message(stream, &BgpMessage::KeepAlive).await?;
+    assert!(
+        matches!(read_message(stream).await?, BgpMessage::Update(_)),
+        "{peer_address} did not get the establishment table"
+    );
+    assert!(ipv4_eor(&read_message(stream).await?));
+    let peer = bgp
+        .peer_show(peer_address)
+        .await
+        .context("the peer stays configured")?;
+    assert!(
+        matches!(peer.state, PeerState::Established),
+        "{peer_address}: {:?}",
+        peer.state
+    );
+    assert_eq!(peer.auth_mode, mode, "{peer_address}");
+    Ok(())
+}
+
+/// Skips an AO-dependent test when the kernel lacks TCP-AO, but refuses to skip
+/// when the run declares TCP-AO has to be exercised (`FOCL_REQUIRE_TCP_AO=1`,
+/// which CI sets): a green suite must not hide an untested path.
+fn tcp_ao_or_skip(test: &str) -> bool {
+    if tcp_ao_supported() {
+        return true;
+    }
+    if std::env::var("FOCL_REQUIRE_TCP_AO").is_ok_and(|value| value == "1") {
+        panic!(
+            "{test} requires TCP-AO (FOCL_REQUIRE_TCP_AO=1) but this kernel does not implement it"
+        );
+    }
+    eprintln!("skipping {test}: the kernel has no TCP-AO");
+    false
+}
+
+/// TCP-AO (RFC 5925) on a passive session, for both RFC 5926 algorithms: the
+/// listener holds the peer's key, so its signed SYN is accepted and the
+/// session runs over a TCP-AO protected connection.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn passive_session_with_tcp_ao_completes_the_handshake() -> Result<()> {
+    if !tcp_ao_or_skip("passive_session_with_tcp_ao_completes_the_handshake") {
+        return Ok(());
+    }
+    for algorithm in [TcpAoAlgorithm::HmacSha1_96, TcpAoAlgorithm::Aes128Cmac96] {
+        let temp = tempfile::tempdir()?;
+        let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let mut peer = test_peer(port, 30);
+        peer.tcp_ao_keys = focl_ao_keys(algorithm);
+        let listen_addr = format!("127.0.0.1:{port}");
+        let bgp = start_service(&temp, focl_v4_prefix(), peer, Some(&listen_addr)).await?;
+
+        let remote = SocketAddr::from(([127, 0, 0, 1], port));
+        let socket = TcpSocket::new_v4()?;
+        socket.set_tcp_ao_keys(&remote, &peer_ao_keys(algorithm, AO_SECRET))?;
+        let mut stream = timeout(Duration::from_secs(5), socket.connect(remote))
+            .await
+            .with_context(|| format!("{algorithm:?}: the listener refused a TCP-AO peer"))??;
+
+        complete_authenticated_session(&bgp, &mut stream, PeerAuthMode::TcpAo).await?;
+        assert_peer_side_tcp_ao(&stream)?;
+    }
+    Ok(())
+}
+
+/// A peer configured for TCP-AO gets no session over an unsigned connection
+/// or one signed with the wrong secret, and a failed attempt does not stop
+/// the right key from working afterwards.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn passive_tcp_ao_peer_refuses_unsigned_and_wrongly_keyed_connections() -> Result<()> {
+    if !tcp_ao_or_skip("passive_tcp_ao_peer_refuses_unsigned_and_wrongly_keyed_connections") {
+        return Ok(());
+    }
+    let algorithm = TcpAoAlgorithm::HmacSha1_96;
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let mut peer = test_peer(port, 30);
+    peer.tcp_ao_keys = focl_ao_keys(algorithm);
+    let listen_addr = format!("127.0.0.1:{port}");
+    let bgp = start_service(&temp, focl_v4_prefix(), peer, Some(&listen_addr)).await?;
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+
+    assert!(
+        !receives_open(TcpSocket::new_v4()?, remote).await,
+        "an unsigned connection got a session"
+    );
+    let wrong_secret = TcpSocket::new_v4()?;
+    wrong_secret.set_tcp_ao_keys(&remote, &peer_ao_keys(algorithm, "not-the-secret"))?;
+    assert!(
+        !receives_open(wrong_secret, remote).await,
+        "a connection with the wrong secret got a session"
+    );
+    let md5_instead = TcpSocket::new_v4()?;
+    md5_instead.set_md5_signature(&remote, AO_SECRET)?;
+    assert!(
+        !receives_open(md5_instead, remote).await,
+        "a TCP-MD5 connection got a session from a TCP-AO peer"
+    );
+    let peer = bgp.peer_show("127.0.0.1").await.context("peer exists")?;
+    assert!(!matches!(peer.state, PeerState::Established));
+
+    let right_key = TcpSocket::new_v4()?;
+    right_key.set_tcp_ao_keys(&remote, &peer_ao_keys(algorithm, AO_SECRET))?;
+    assert!(
+        receives_open(right_key, remote).await,
+        "the right key no longer works after refused attempts"
+    );
+    Ok(())
+}
+
+/// TCP-MD5 counterpart of the TCP-AO refusal test.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn passive_md5_peer_refuses_unsigned_and_wrongly_keyed_connections() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let bgp = service_with_peer(&temp, port, vec![], Some(MD5_PASSWORD), 30).await?;
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+
+    assert!(
+        !receives_open(TcpSocket::new_v4()?, remote).await,
+        "an unsigned connection got a session"
+    );
+    let wrong_password = TcpSocket::new_v4()?;
+    wrong_password.set_md5_signature(&remote, "not-the-password")?;
+    assert!(
+        !receives_open(wrong_password, remote).await,
+        "a connection with the wrong password got a session"
+    );
+    let peer = bgp.peer_show("127.0.0.1").await.context("peer exists")?;
+    assert!(!matches!(peer.state, PeerState::Established));
+
+    let right_password = TcpSocket::new_v4()?;
+    right_password.set_md5_signature(&remote, MD5_PASSWORD)?;
+    assert!(
+        receives_open(right_password, remote).await,
+        "the right password no longer works after refused attempts"
+    );
+    Ok(())
+}
+
+/// A `[::]` listener sees an IPv4 peer v4-mapped: its key goes on in that
+/// form and the accepted connection still matches the configured IPv4 peer.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dual_stack_listener_serves_an_authenticated_ipv4_peer() -> Result<()> {
+    let mut cases = vec![(PeerAuthMode::Md5, None)];
+    if tcp_ao_or_skip("dual_stack_listener_serves_an_authenticated_ipv4_peer (TCP-AO case)") {
+        cases.push((PeerAuthMode::TcpAo, Some(TcpAoAlgorithm::HmacSha1_96)));
+    }
+    for (auth_mode, algorithm) in cases {
+        let temp = tempfile::tempdir()?;
+        let port = StdTcpListener::bind("[::]:0")?.local_addr()?.port();
+        let remote = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut peer = test_peer(port, 30);
+        let socket = TcpSocket::new_v4()?;
+        match algorithm {
+            Some(algorithm) => {
+                peer.tcp_ao_keys = focl_ao_keys(algorithm);
+                socket.set_tcp_ao_keys(&remote, &peer_ao_keys(algorithm, AO_SECRET))?;
+            }
+            None => {
+                peer.password = Some(MD5_PASSWORD.to_string());
+                socket.set_md5_signature(&remote, MD5_PASSWORD)?;
+            }
+        }
+        let listen_addr = format!("[::]:{port}");
+        let bgp = start_service(&temp, focl_v4_prefix(), peer, Some(&listen_addr)).await?;
+
+        let mut stream = timeout(Duration::from_secs(5), socket.connect(remote))
+            .await
+            .with_context(|| {
+                format!("{auth_mode:?}: the dual-stack listener refused the peer")
+            })??;
+        complete_authenticated_session(&bgp, &mut stream, auth_mode).await?;
+    }
+    Ok(())
+}
+
+/// An IPv4 peer may be configured in its v4-mapped spelling. It is the same
+/// peer as far as the kernel is concerned, so it is keyed and matched as the
+/// IPv4 address it is.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dual_stack_listener_serves_a_peer_configured_v4_mapped() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let port = StdTcpListener::bind("[::]:0")?.local_addr()?.port();
+    let remote = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut peer = test_peer(port, 30);
+    peer.address = "::ffff:127.0.0.1".to_string();
+    peer.password = Some(MD5_PASSWORD.to_string());
+    let listen_addr = format!("[::]:{port}");
+    let _bgp = start_service(&temp, vec![], peer, Some(&listen_addr)).await?;
+
+    assert!(
+        !receives_open(TcpSocket::new_v4()?, remote).await,
+        "an unsigned connection got a session"
+    );
+    let socket = TcpSocket::new_v4()?;
+    socket.set_md5_signature(&remote, MD5_PASSWORD)?;
+    assert!(
+        receives_open(socket, remote).await,
+        "the peer configured as ::ffff:127.0.0.1 got no session from 127.0.0.1"
+    );
+    Ok(())
+}
+
+/// A keyed listener at 127.0.0.1 that only accepts focld's signed SYN, and
+/// an active focld peer dialing it with no `local_address`. Before the key
+/// install moved ahead of `connect()`, that path sent its SYN unsigned.
+async fn active_session_against(
+    listener: TcpSocket,
+    auth: impl FnOnce(&mut PeerConfig),
+    auth_mode: PeerAuthMode,
+) -> Result<TcpStream> {
+    let listener = listener.listen(8)?;
+    let port = listener.local_addr()?.port();
+    let temp = tempfile::tempdir()?;
+    let mut peer = test_peer(port, 30);
+    peer.passive = false;
+    auth(&mut peer);
+    let bgp = start_service(&temp, focl_v4_prefix(), peer, None).await?;
+
+    let (mut stream, _) = timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .context("focld never completed an authenticated handshake")??;
+    complete_authenticated_session(&bgp, &mut stream, auth_mode).await?;
+    Ok(stream)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn active_session_with_tcp_ao_signs_its_syn() -> Result<()> {
+    if !tcp_ao_or_skip("active_session_with_tcp_ao_signs_its_syn") {
+        return Ok(());
+    }
+    let algorithm = TcpAoAlgorithm::Aes128Cmac96;
+    let listener = TcpSocket::new_v4()?;
+    listener.bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    listener.set_tcp_ao_keys(
+        &SocketAddr::from(([127, 0, 0, 1], 0)),
+        &peer_ao_keys(algorithm, AO_SECRET),
+    )?;
+    let stream = active_session_against(
+        listener,
+        |peer| peer.tcp_ao_keys = focl_ao_keys(algorithm),
+        PeerAuthMode::TcpAo,
+    )
+    .await?;
+    assert_peer_side_tcp_ao(&stream)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn active_session_with_md5_signs_its_syn() -> Result<()> {
+    let listener = TcpSocket::new_v4()?;
+    listener.bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    listener.set_md5_signature(&SocketAddr::from(([127, 0, 0, 1], 0)), MD5_PASSWORD)?;
+    active_session_against(
+        listener,
+        |peer| peer.password = Some(MD5_PASSWORD.to_string()),
+        PeerAuthMode::Md5,
+    )
+    .await?;
     Ok(())
 }
 

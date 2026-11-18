@@ -13,7 +13,7 @@ env:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +27,8 @@ jobs:
         run: cargo build --verbose
 
       - name: Run tests
+        env:
+          FOCL_REQUIRE_TCP_AO: "1"
         run: cargo test --verbose
 
   create-release:

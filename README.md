@@ -26,6 +26,7 @@ The project consists of:
 
 - [x] IPv4 and IPv6 unicast support
 - [x] TCP-MD5 authentication (RFC 2385) for BGP session security
+- [x] TCP-AO authentication (RFC 5925) for BGP session security
 - [x] Static prefix announcements
 - [x] Runtime prefix announce/withdraw via `focl prefix` (in-memory overrides)
 - [x] Full BGP FSM with proper timers (hold/keepalive)
@@ -170,7 +171,7 @@ See `focl-vultr-example.toml` for a complete production-style example with docum
 - **bgpkit-parser** - BGP message parsing and MRT encoding
 - **tokio** - Async runtime
 - **serde/toml** - Configuration handling
-- **libc** - TCP-MD5 socket options (Linux only)
+- **libc** / **linux-raw-sys** - TCP-MD5 and TCP-AO socket options (Linux only)
 
 ## Platform Support
 
@@ -179,9 +180,68 @@ See `focl-vultr-example.toml` for a complete production-style example with docum
 | BGP Speaker | ✓ | ✓ | ✓ | ? |
 | IPv4/IPv6 | ✓ | ✓ | ✓ | ? |
 | TCP-MD5 Auth | ✓ | ✗ | ✗ | ✗ |
+| TCP-AO Auth | ✓ | ✗ | ✗ | ✗ |
 | MRT Archival | ✓ | ✓ | ✓ | ? |
 
-*Note: TCP-MD5 (RFC 2385) requires Linux kernel support*
+*Note: TCP-MD5 (RFC 2385) requires Linux kernel support; TCP-AO (RFC 5925) requires Linux 6.7+ built with `CONFIG_TCP_AO`*
+
+## TCP Authentication
+
+A peer authenticates its TCP connection with either TCP-MD5 (`password`) or
+TCP-AO (`tcp_ao_keys`), never both. TCP-AO takes one or more master key
+tuples:
+
+```toml
+[[peers]]
+name = "upstream"
+address = "192.0.2.2"
+remote_as = 65002
+
+[[peers.tcp_ao_keys]]
+send_id = 1                    # KeyID we sign with = the peer's recv id
+recv_id = 2                    # KeyID the peer signs with = its send id
+algorithm = "hmac-sha1-96"     # or "aes-128-cmac-96" (RFC 5926)
+secret = "[REDACTED]"          # 1-80 bytes
+```
+
+On a connection focl opens, the key marked `current = true` (else the first)
+signs and is the one focl asks the peer to sign with; the others stay
+installed for the peer to use. On a connection the peer opens, the peer's SYN
+picks both keys (Linux does not let a listener choose), so `current` has no
+effect there and focl logs a warning when the session runs on other keys.
+
+The keys are installed before `connect()` on active sessions and on the
+listening socket, before it starts listening, for passive ones, so the kernel
+verifies the very first SYN; an accepted connection from a TCP-AO peer is
+also checked to really be TCP-AO protected. If the listening socket refuses a
+peer's key, focl logs the error and `focl peer show` reports it as the peer's
+`last_error`. Inbound connections from a peer the listener holds no key for
+are dropped, as nothing would have verified them. Changing keys requires a
+restart.
+`focl peer show` reports `auth_mode` (`none`, `md5` or `tcp_ao`), and a key the
+kernel refused to install on the listening socket appears there as
+`listener_key_error`; the peer keeps running without that key and a later
+session error does not clear the field.
+
+`focld` refuses to start when an enabled peer has `tcp_ao_keys` and the
+kernel has no TCP-AO: such a peer could never get a session. Remove the keys
+or set `enabled = false` on the peer to run the others.
+
+A peer that never connects usually has mismatched keys: the kernel drops
+segments that fail authentication silently. Its counters say why:
+
+```bash
+nstat -az | grep -E 'TCPAO(Good|Bad|KeyNotFound|Required)'
+```
+
+* `TCPAOBad`: a segment failed its MAC (wrong secret or algorithm).
+* `TCPAOKeyNotFound`: a segment carried a TCP-AO option whose KeyID matched no
+  installed key, which includes a signed SYN from a peer the socket has no key
+  for.
+* `TCPAORequired`: an unsigned segment reached a socket that requires TCP-AO.
+  That is a listener holding a key for the peer, a session we opened with
+  `ao_required`, or an accepted session whose keys were copied from such a
+  listener.
 
 ## Development
 
@@ -195,6 +255,7 @@ cargo test
 cd scripts/interop
 ./run_gobgp_smoke.sh        # Basic test
 ./run_gobgp_md5.sh          # MD5 authentication test (Linux only)
+./run_bird_tcpao.sh         # TCP-AO test against BIRD 2.17+/3.1+ (Linux only)
 ```
 
 ### Code Quality
@@ -224,7 +285,7 @@ cargo clippy --no-default-features
 | `asn` | u32 | required | Local AS number |
 | `router_id` | string | required | Router ID (IPv4) |
 | `listen` | bool | true | Accept incoming connections |
-| `listen_addr` | string | "0.0.0.0:179" | Bind address |
+| `listen_addr` | string | "0.0.0.0:179" | Bind address; `[::]:179` accepts IPv4 peers as v4-mapped while the socket's `IPV6_V6ONLY` is 0, which is the Linux default |
 | `control_socket` | path | "/tmp/focld.sock" | CLI socket path |
 | `log_level` | string | "info" | Log level |
 
@@ -239,8 +300,12 @@ cargo clippy --no-default-features
 | `hold_time_secs` | u16 | 90 | BGP hold timer |
 | `connect_retry_secs` | u16 | 5 | Reconnect interval |
 | `passive` | bool | false | Wait for peer to connect |
-| `password` | string | none | TCP-MD5 password |
+| `password` | string | none | TCP-MD5 password (1-80 bytes) |
+| `tcp_ao_keys` | array | none | TCP-AO keys: `send_id`, `recv_id`, `algorithm`, `secret`, optional `current` |
 | `route_refresh` | bool | true | Enable route refresh |
+
+A key that a `[[peers]]` or `[[peers.tcp_ao_keys]]` table does not know is a
+config error, so a misspelled `password` cannot leave a peer unauthenticated.
 
 ### Prefix Settings
 
