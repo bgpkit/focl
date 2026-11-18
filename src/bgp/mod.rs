@@ -781,6 +781,7 @@ impl BgpService {
     }
 
     async fn peer_loop(&self, peer: PeerConfig) {
+        tracing::debug!(peer = %peer.address, "active peer loop started");
         loop {
             self.set_peer_state(&peer.address, PeerState::Connect, None, None)
                 .await;
@@ -1283,9 +1284,15 @@ impl BgpService {
         let old_state = {
             let mut peers = self.inner.peers.write().await;
             let Some(runtime) = peers.get_mut(address) else {
+                tracing::warn!(
+                    address,
+                    ?state,
+                    "state change for a peer that is not running"
+                );
                 return;
             };
             let old_state = runtime.info.state;
+            tracing::debug!(address, ?old_state, ?state, "peer state");
             runtime.info.state = state;
             if let Some(error) = last_error {
                 runtime.info.last_error = Some(error);
