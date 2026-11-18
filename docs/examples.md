@@ -43,7 +43,6 @@ collector_id = "edge01"            # default when no [[bmp.routers]] match
 layout_profile = "routeviews"
 updates_interval_secs = 900        # RV-style 15-minute update files
 ribs_interval_secs = 7200          # 2-hour RIB dumps, RV convention
-ribs_mode = "trie"                 # trie | initial-only | off  (see plan §RIB)
 compression = "zstd"
 root = "/data/mrt"
 retention_days = 30                # local auto-cleanup after replication
@@ -115,7 +114,6 @@ collector_id = "focl01"
 layout_profile = "ris"       # rrc-style: updates.* + bview.*
 updates_interval_secs = 300  # RIS-style 5-minute update files
 ribs_interval_secs = 86400   # daily bview from adj-rib-in trie
-ribs_mode = "trie"
 compression = "gzip"
 root = "/data/mrt"
 ```
@@ -166,7 +164,7 @@ Memory (RSS), per full feed peer held as adj-rib-in trie:
 |---|---|---|
 | naive (bytes inline) | 150-250 MB | never ship this |
 | interned attrs, u32 values | 60-120 MB | default |
-| ribs_mode = initial-only | < 10 MB | dump only the post-EoR walk, then updates only |
+| planned `ribs_mode = initial-only` | < 10 MB | dump only the post-EoR walk, then updates only; not implemented yet |
 
 Plus one process-wide interned attribute store (~50-100 MB total; cross-peer
 dedup for similar feeds). **All memory figures below are planning estimates
@@ -181,7 +179,7 @@ cardinality, churn; see plan §Scale item 8). Fleet sketch, interned mode,
 | 200 | 12-25 GB | ~200 GB | ~$90 |
 
 Knobs that move the needle: `ribs_interval_secs` (biggest storage lever),
-`ribs_mode` (biggest memory lever), `retention_days`, compression choice
+the planned `ribs_mode` (biggest memory lever), `retention_days`, compression choice
 (zstd-3 recommended: ~bz2 size at ~10x speed).
 
 ## Reading the archive

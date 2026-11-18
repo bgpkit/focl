@@ -27,6 +27,8 @@ jobs:
         run: cargo build --verbose
 
       - name: Run tests
+        env:
+          FOCL_REQUIRE_TCP_AO: "1"
         run: cargo test --verbose
 
   create-release:

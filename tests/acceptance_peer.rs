@@ -875,13 +875,28 @@ async fn one_listener_serves_a_keyed_and_an_unkeyed_peer() -> Result<()> {
 }
 
 /// TCP-AO (RFC 5925) on a passive session, for both RFC 5926 algorithms: the
+/// Skips an AO-dependent test when the kernel lacks TCP-AO, but refuses to skip
+/// when the run declares TCP-AO has to be exercised (`FOCL_REQUIRE_TCP_AO=1`,
+/// which CI sets): a green suite must not hide an untested path.
+fn tcp_ao_or_skip(test: &str) -> bool {
+    if tcp_ao_supported() {
+        return true;
+    }
+    if std::env::var("FOCL_REQUIRE_TCP_AO").is_ok_and(|value| value == "1") {
+        panic!(
+            "{test} requires TCP-AO (FOCL_REQUIRE_TCP_AO=1) but this kernel does not implement it"
+        );
+    }
+    eprintln!("skipping {test}: the kernel has no TCP-AO");
+    false
+}
+
 /// listener holds the peer's key, so its signed SYN is accepted and the
 /// session runs over a TCP-AO protected connection.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn passive_session_with_tcp_ao_completes_the_handshake() -> Result<()> {
-    if !tcp_ao_supported() {
-        eprintln!("skipping: the kernel has no TCP-AO");
+    if !tcp_ao_or_skip("passive_session_with_tcp_ao_completes_the_handshake") {
         return Ok(());
     }
     for algorithm in [TcpAoAlgorithm::HmacSha1_96, TcpAoAlgorithm::Aes128Cmac96] {
@@ -911,8 +926,7 @@ async fn passive_session_with_tcp_ao_completes_the_handshake() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn passive_tcp_ao_peer_refuses_unsigned_and_wrongly_keyed_connections() -> Result<()> {
-    if !tcp_ao_supported() {
-        eprintln!("skipping: the kernel has no TCP-AO");
+    if !tcp_ao_or_skip("passive_tcp_ao_peer_refuses_unsigned_and_wrongly_keyed_connections") {
         return Ok(());
     }
     let algorithm = TcpAoAlgorithm::HmacSha1_96;
@@ -989,10 +1003,8 @@ async fn passive_md5_peer_refuses_unsigned_and_wrongly_keyed_connections() -> Re
 #[tokio::test]
 async fn dual_stack_listener_serves_an_authenticated_ipv4_peer() -> Result<()> {
     let mut cases = vec![(PeerAuthMode::Md5, None)];
-    if tcp_ao_supported() {
+    if tcp_ao_or_skip("dual_stack_listener_serves_an_authenticated_ipv4_peer (TCP-AO case)") {
         cases.push((PeerAuthMode::TcpAo, Some(TcpAoAlgorithm::HmacSha1_96)));
-    } else {
-        eprintln!("skipping the TCP-AO case: the kernel has no TCP-AO");
     }
     for (auth_mode, algorithm) in cases {
         let temp = tempfile::tempdir()?;
@@ -1077,8 +1089,7 @@ async fn active_session_against(
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn active_session_with_tcp_ao_signs_its_syn() -> Result<()> {
-    if !tcp_ao_supported() {
-        eprintln!("skipping: the kernel has no TCP-AO");
+    if !tcp_ao_or_skip("active_session_with_tcp_ao_signs_its_syn") {
         return Ok(());
     }
     let algorithm = TcpAoAlgorithm::Aes128Cmac96;

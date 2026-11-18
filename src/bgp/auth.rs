@@ -276,30 +276,41 @@ pub fn tcp_ao_status(_socket_fd: i32) -> Result<Option<TcpAoStatus>> {
     anyhow::bail!("TCP-AO authentication is only supported on Linux (RFC 5925)")
 }
 
-/// Whether the running kernel implements TCP-AO (Linux 6.7+ built with
-/// `CONFIG_TCP_AO`).
+/// Probes the socket option: `Ok(true)` when the kernel implements TCP-AO
+/// (Linux 6.7+ built with `CONFIG_TCP_AO`), `Ok(false)` when it does not, and
+/// `Err` when the probe itself failed (no descriptor, `EPERM`, ...), so a
+/// failure is never reported as a missing kernel feature.
 #[cfg(target_os = "linux")]
-pub fn tcp_ao_supported() -> bool {
+pub fn tcp_ao_probe() -> std::io::Result<bool> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
     // SAFETY: plain socket(2); the descriptor is owned and closed below.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
-        return false;
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `fd` is a fresh descriptor nothing else owns.
     let socket = unsafe { OwnedFd::from_raw_fd(fd) };
-    // A kernel with TCP-AO reports that this keyless socket has no AO state;
-    // one without it does not know the option.
+    // A kernel with TCP-AO reports that this keyless socket has no AO state
+    // (`ENOENT`); a kernel without the option reports `ENOPROTOOPT`. Anything
+    // else (no descriptor, `EPERM`) is a failed probe, not a missing feature.
     match get_tcp_ao_info(socket.as_raw_fd()) {
-        Ok(_) => true,
-        Err(err) => err.raw_os_error() == Some(libc::ENOENT),
+        Ok(_) => Ok(true),
+        Err(err) if err.raw_os_error() == Some(libc::ENOENT) => Ok(true),
+        Err(err) if err.raw_os_error() == Some(libc::ENOPROTOOPT) => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
 #[cfg(not(target_os = "linux"))]
+pub fn tcp_ao_probe() -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Whether the running kernel implements TCP-AO, treating a failed probe as
+/// "no support". Callers that report to an operator use [`tcp_ao_probe`].
 pub fn tcp_ao_supported() -> bool {
-    false
+    tcp_ao_probe().unwrap_or(false)
 }
 
 /// Extension trait to set TCP-MD5 or TCP-AO on tokio TcpSocket
@@ -368,12 +379,26 @@ mod tests {
         }
     }
 
+    /// Skips an AO-dependent test when the kernel lacks TCP-AO, but refuses to
+    /// skip when the run declares TCP-AO has to be exercised
+    /// (`FOCL_REQUIRE_TCP_AO=1`, set by CI): a green suite must not hide an
+    /// untested path.
+    fn tcp_ao_or_skip(test: &str) -> bool {
+        if tcp_ao_supported() {
+            return true;
+        }
+        if std::env::var("FOCL_REQUIRE_TCP_AO").is_ok_and(|value| value == "1") {
+            panic!("{test} requires TCP-AO (FOCL_REQUIRE_TCP_AO=1) but this kernel does not implement it");
+        }
+        eprintln!("skipping {test}: kernel has no TCP-AO");
+        false
+    }
+
     /// A dual-stack listener sees IPv4 peers as v4-mapped addresses, so their
     /// keys go in that form; the kernel files them as IPv4 keys with a /32.
     #[test]
     fn dual_stack_listener_accepts_v4_mapped_keys() {
-        if !tcp_ao_supported() {
-            eprintln!("skipping: kernel has no TCP-AO");
+        if !tcp_ao_or_skip("dual_stack_listener_accepts_v4_mapped_keys") {
             return;
         }
         let listener = std::net::TcpListener::bind("[::]:0").expect("bind [::]:0");
@@ -393,8 +418,7 @@ mod tests {
 
     #[test]
     fn keyless_socket_reports_no_tcp_ao() {
-        if !tcp_ao_supported() {
-            eprintln!("skipping: kernel has no TCP-AO");
+        if !tcp_ao_or_skip("keyless_socket_reports_no_tcp_ao") {
             return;
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -405,8 +429,7 @@ mod tests {
     /// which is why config validation insists on unique ids.
     #[test]
     fn kernel_rejects_duplicate_key_ids_for_one_peer() {
-        if !tcp_ao_supported() {
-            eprintln!("skipping: kernel has no TCP-AO");
+        if !tcp_ao_or_skip("kernel_rejects_duplicate_key_ids_for_one_peer") {
             return;
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -422,8 +445,7 @@ mod tests {
     /// of it, so `current` in the config cannot reach a passive session.
     #[tokio::test]
     async fn accepted_connection_signs_with_the_key_the_syn_names() {
-        if !tcp_ao_supported() {
-            eprintln!("skipping: kernel has no TCP-AO");
+        if !tcp_ao_or_skip("accepted_connection_signs_with_the_key_the_syn_names") {
             return;
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -524,7 +524,9 @@ impl BgpService {
         // `FoclConfig::load` validates, but a config built in code arrives
         // unchecked, and `peer_auth` relies on a peer naming one mechanism.
         cfg.validate().context("invalid configuration")?;
-        require_tcp_ao_support(&cfg.peers, tcp_ao_supported())?;
+        let kernel_tcp_ao =
+            auth::tcp_ao_probe().context("could not tell whether the kernel implements TCP-AO")?;
+        require_tcp_ao_support(&cfg.peers, kernel_tcp_ao)?;
         let router_id = cfg
             .global
             .router_id
@@ -617,8 +619,13 @@ impl BgpService {
         // can tell afterwards. A peer whose key did not make it is refused
         // in `accept_inbound`.
         let local_addr = socket.local_addr()?;
-        let (unkeyed, failures) =
-            install_listener_auth_keys(local_addr, socket.as_raw_fd(), &listener_auth_keys(peers));
+        let v6_only = local_addr.is_ipv6() && listener_v6_only(socket.as_raw_fd());
+        let (unkeyed, failures) = install_listener_auth_keys(
+            local_addr,
+            socket.as_raw_fd(),
+            &listener_auth_keys(peers),
+            v6_only,
+        );
         // Record a key that never reached the socket, and a passive peer that
         // can never connect, where `focl peer show` reads it instead of
         // leaving it to the startup log.
@@ -628,7 +635,7 @@ impl BgpService {
             self.set_peer_state(&address, PeerState::Idle, Some(error), None)
                 .await;
         }
-        for peer in unreachable_passive_peers(local_addr, peers) {
+        for peer in unreachable_passive_peers(local_addr, peers, v6_only) {
             tracing::warn!(peer=%peer.address, listener=%local_addr, "passive peer can never connect: the BGP listener does not take connections of its address family");
             let error = format!(
                 "listener {local_addr} does not take connections of this peer's address family"
@@ -2183,12 +2190,12 @@ fn listener_auth_keys(peers: &[PeerConfig]) -> Vec<(String, IpAddr, PeerAuth<'_>
 /// peers v4-mapped. The port is not part of the kernel's lookup for either
 /// option (the source port of an inbound connection is ephemeral), so the BGP
 /// port is used.
-fn listener_key_addr(listener: SocketAddr, peer: IpAddr) -> Option<SocketAddr> {
+fn listener_key_addr(listener: SocketAddr, peer: IpAddr, v6_only: bool) -> Option<SocketAddr> {
     let address = match (listener.ip(), peer) {
         (IpAddr::V4(_), IpAddr::V4(_)) => peer,
         (IpAddr::V4(_), IpAddr::V6(_)) => return None,
         (IpAddr::V6(local), IpAddr::V4(v4)) => {
-            if !local.is_unspecified() && local.to_ipv4_mapped().is_none() {
+            if v6_only || (!local.is_unspecified() && local.to_ipv4_mapped().is_none()) {
                 return None;
             }
             IpAddr::V6(v4.to_ipv6_mapped())
@@ -2206,14 +2213,45 @@ fn listener_key_addr(listener: SocketAddr, peer: IpAddr) -> Option<SocketAddr> {
 /// The enabled passive peers a listener bound to `listener` can never accept,
 /// because it does not take connections of their address family. Only they
 /// depend on the listener: an active peer dials out.
-fn unreachable_passive_peers(listener: SocketAddr, peers: &[PeerConfig]) -> Vec<&PeerConfig> {
+fn unreachable_passive_peers(
+    listener: SocketAddr,
+    peers: &[PeerConfig],
+    v6_only: bool,
+) -> Vec<&PeerConfig> {
     peers
         .iter()
         .filter(|peer| peer.enabled && peer.passive)
         .filter(|peer| {
-            peer_ip(peer).is_some_and(|address| listener_key_addr(listener, address).is_none())
+            peer_ip(peer)
+                .is_some_and(|address| listener_key_addr(listener, address, v6_only).is_none())
         })
         .collect()
+}
+
+/// Reads `IPV6_V6ONLY` from the bound listening socket. A `[::]` listener takes
+/// IPv4 connections as v4-mapped only while this is off (`net.ipv6.bindv6only`).
+fn listener_v6_only(fd: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `value` and `len` outlive the call and match the option.
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &mut value as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        result == 0 && value != 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        false
+    }
 }
 
 /// Installs `keys` on the socket of the BGP listener. A TCP-AO key goes on
@@ -2231,11 +2269,12 @@ fn install_listener_auth_keys(
     listener: SocketAddr,
     fd: i32,
     keys: &[(String, IpAddr, PeerAuth<'_>)],
+    v6_only: bool,
 ) -> (HashSet<IpAddr>, Vec<(String, String)>) {
     let mut unkeyed = HashSet::new();
     let mut failures = Vec::new();
     for (configured, address, peer_auth) in keys {
-        let Some(remote) = listener_key_addr(listener, *address) else {
+        let Some(remote) = listener_key_addr(listener, *address, v6_only) else {
             // No connection of this peer's address family reaches the
             // listener, so there is nothing to key; `start_listener` reports
             // the passive peers this leaves stranded. Should one arrive
@@ -2578,6 +2617,34 @@ mod tests {
     }
 
     #[test]
+    fn v6_only_is_read_from_the_bound_socket() {
+        let dual = TcpSocket::new_v6().unwrap();
+        dual.bind("[::]:0".parse().unwrap()).unwrap();
+        assert!(!listener_v6_only(dual.as_raw_fd()), "dual-stack by default");
+
+        let only = TcpSocket::new_v6().unwrap();
+        let one: libc::c_int = 1;
+        // SAFETY: the option value outlives the call and matches IPV6_V6ONLY.
+        let rc = unsafe {
+            libc::setsockopt(
+                only.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "set IPV6_V6ONLY: {}",
+            std::io::Error::last_os_error()
+        );
+        only.bind("[::]:0".parse().unwrap()).unwrap();
+        assert!(listener_v6_only(only.as_raw_fd()));
+    }
+
+    #[test]
     fn listener_binding_falls_through_to_the_next_address() {
         let addresses = vec![
             "192.0.2.1:179".parse().unwrap(),
@@ -2660,7 +2727,7 @@ mod tests {
         let keys = listener_auth_keys(&peers);
         let listener: SocketAddr = "[::]:179".parse().unwrap();
         // No socket behind the descriptor: every install fails.
-        let (unkeyed, failures) = install_listener_auth_keys(listener, -1, &keys);
+        let (unkeyed, failures) = install_listener_auth_keys(listener, -1, &keys, false);
         assert_eq!(
             unkeyed,
             HashSet::from([
@@ -2676,7 +2743,8 @@ mod tests {
             let socket = TcpSocket::new_v6().unwrap();
             socket.bind("[::]:0".parse().unwrap()).unwrap();
             let bound = socket.local_addr().unwrap();
-            let (unkeyed, failures) = install_listener_auth_keys(bound, socket.as_raw_fd(), &keys);
+            let (unkeyed, failures) =
+                install_listener_auth_keys(bound, socket.as_raw_fd(), &keys, false);
             assert!(
                 unkeyed.is_empty() && failures.is_empty(),
                 "a socket that is bound but not listening yet takes the keys"
@@ -2687,7 +2755,8 @@ mod tests {
             let socket = TcpSocket::new_v4().unwrap();
             socket.bind("0.0.0.0:0".parse().unwrap()).unwrap();
             let bound = socket.local_addr().unwrap();
-            let (unkeyed, failures) = install_listener_auth_keys(bound, socket.as_raw_fd(), &keys);
+            let (unkeyed, failures) =
+                install_listener_auth_keys(bound, socket.as_raw_fd(), &keys, false);
             assert_eq!(
                 unkeyed,
                 HashSet::from(["2001:db8::1".parse::<IpAddr>().unwrap()])
@@ -2785,34 +2854,42 @@ mod tests {
         let v4_peer: IpAddr = "192.0.2.1".parse().unwrap();
         let v6_peer: IpAddr = "2001:db8::1".parse().unwrap();
         assert_eq!(
-            listener_key_addr(v4_listener, v4_peer),
+            listener_key_addr(v4_listener, v4_peer, false),
             Some(SocketAddr::new(v4_peer, 179))
         );
-        assert_eq!(listener_key_addr(v4_listener, v6_peer), None);
+        assert_eq!(listener_key_addr(v4_listener, v6_peer, false), None);
         assert_eq!(
-            listener_key_addr(v6_listener, v4_peer),
+            listener_key_addr(v6_listener, v4_peer, false),
             Some("[::ffff:192.0.2.1]:179".parse().unwrap())
         );
         assert_eq!(
-            listener_key_addr(v6_listener, v6_peer),
+            listener_key_addr(v6_listener, v6_peer, false),
+            Some(SocketAddr::new(v6_peer, 179))
+        );
+
+        // `net.ipv6.bindv6only=1`: a `[::]` listener takes no IPv4 connections,
+        // so an IPv4 peer cannot be keyed and cannot reach it either.
+        assert_eq!(listener_key_addr(v6_listener, v4_peer, true), None);
+        assert_eq!(
+            listener_key_addr(v6_listener, v6_peer, true),
             Some(SocketAddr::new(v6_peer, 179))
         );
 
         // Bound to one IPv6 address, a listener takes no IPv4 connections.
         let v6_only_listener: SocketAddr = "[2001:db8::2]:179".parse().unwrap();
-        assert_eq!(listener_key_addr(v6_only_listener, v4_peer), None);
+        assert_eq!(listener_key_addr(v6_only_listener, v4_peer, false), None);
         assert_eq!(
-            listener_key_addr(v6_only_listener, v6_peer),
+            listener_key_addr(v6_only_listener, v6_peer, false),
             Some(SocketAddr::new(v6_peer, 179))
         );
 
         // Bound to a v4-mapped address, an IPv6 socket takes only IPv4 ones.
         let mapped_listener: SocketAddr = "[::ffff:192.0.2.9]:179".parse().unwrap();
         assert_eq!(
-            listener_key_addr(mapped_listener, v4_peer),
+            listener_key_addr(mapped_listener, v4_peer, false),
             Some("[::ffff:192.0.2.1]:179".parse().unwrap())
         );
-        assert_eq!(listener_key_addr(mapped_listener, v6_peer), None);
+        assert_eq!(listener_key_addr(mapped_listener, v6_peer, false), None);
     }
 
     #[test]
@@ -2833,16 +2910,21 @@ mod tests {
             active("2001:db8::4"),
             active("192.0.2.4"),
         ];
-        let unreachable = |listener: &str| -> Vec<&str> {
-            unreachable_passive_peers(listener.parse().unwrap(), &peers)
+        let unreachable = |listener: &str, v6_only: bool| -> Vec<&str> {
+            unreachable_passive_peers(listener.parse().unwrap(), &peers, v6_only)
                 .into_iter()
                 .map(|peer| peer.address.as_str())
                 .collect()
         };
 
-        assert_eq!(unreachable("0.0.0.0:179"), ["2001:db8::1", "2001:db8::2"]);
-        assert_eq!(unreachable("[2001:db8::9]:179"), ["192.0.2.1"]);
-        assert!(unreachable_passive_peers("[::]:179".parse().unwrap(), &peers).is_empty());
+        assert_eq!(
+            unreachable("0.0.0.0:179", false),
+            ["2001:db8::1", "2001:db8::2"]
+        );
+        assert_eq!(unreachable("[2001:db8::9]:179", false), ["192.0.2.1"]);
+        assert!(unreachable_passive_peers("[::]:179".parse().unwrap(), &peers, false).is_empty());
+        // bindv6only=1: the IPv4 passive peer is stranded, the IPv6 ones are not.
+        assert_eq!(unreachable("[::]:179", true), ["192.0.2.1"]);
     }
 
     #[test]
