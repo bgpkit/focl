@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 * **BMP export** - a `[bmp]` table makes `focld` dial a monitoring station and report every session it runs: Peer Up with both OPEN PDUs verbatim, every inbound UPDATE as it arrived (End-of-RIB included), a Peer Down when the session ends, and a Statistics Report on a timer as the only liveness signal BMP defines. The station role belongs to a collector such as bgpviews, so focl still does not listen for BMP and `docs/examples.md` example 1 now describes the export instead of a listener that never existed. A station that cannot keep up loses the connection rather than a frame or a BGP session; `docs/bmp-export.md` states what is deliberately not exported. Proven end to end by `scripts/lab/bmp_export.sh` against a real bgpviews archive.
+* **Adj-RIB-Out export** - a station entry with `rib_out = true` sends what this daemon announced to each peer instead, one frame per peer, flagged `O` (RFC 8671) and `L` (the PDU is what was transmitted), while Peer Up, Peer Down and Statistics Reports keep `O` clear as the RFC requires. `[[bmp.stations]]` replaces the single `[bmp].station` key so each direction is its own connection, which is what a station needs in order to keep the two views apart; every path that writes an UPDATE now goes through one helper, so a station is never told about some of our announcements and not others. The lab records both directions of one session and proves by content that neither leaks into the other's archive.
 
 ### Fixes
 

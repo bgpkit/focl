@@ -39,10 +39,19 @@ enabled = true
 
 [bmp]
 enabled = true
-station = "198.51.100.20:1790"     # the station dials nobody; we dial it
 sys_name = "focl-edge01"          # the identity the archive records
 stats_interval_secs = 60
+
+# What the router sends us.
+[[bmp.stations]]
+address = "198.51.100.20:1790"     # the station dials nobody; we dial it
 # peers = ["edge-router"]         # empty exports every established peer
+
+# What we send the router. Drop this entry unless the station records Adj-RIB-Out: it is a
+# second connection, because a station keeps one view per listening port.
+[[bmp.stations]]
+address = "198.51.100.20:1791"
+rib_out = true
 ```
 
 Station side, `bgpviews.toml`:
@@ -56,6 +65,16 @@ feed = "bmp"
 
 [clients.view]
 name = "adj-in-pre"
+updates_interval_minutes = 1
+
+[[clients]]
+name = "focl-out"
+listen = "198.51.100.20:1791"
+allow_from = ["198.51.100.10/32"]
+feed = "bmp"
+
+[clients.view]
+name = "adj-out"
 updates_interval_minutes = 1
 ```
 

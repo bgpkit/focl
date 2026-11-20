@@ -498,8 +498,9 @@ struct BgpServiceInner {
     session_local_ips: RwLock<HashMap<String, IpAddr>>,
     event_tx: broadcast::Sender<EventEnvelope>,
     archive: Option<Arc<ArchiveService>>,
-    /// Set when `[bmp]` names a station: every session then forwards what it received.
-    bmp: Option<ExportHandle>,
+    /// One entry per `[[bmp.stations]]`: every session forwards what the peer sent it (Adj-RIB-In)
+    /// to the inbound stations and what it sent the peer (Adj-RIB-Out) to the others.
+    bmp: Vec<ExportHandle>,
 }
 
 #[derive(Debug)]
@@ -525,7 +526,7 @@ impl BgpService {
         event_tx: broadcast::Sender<EventEnvelope>,
         archive: Option<Arc<ArchiveService>>,
     ) -> Result<Self> {
-        Self::new_with_sinks(cfg, event_tx, archive, None).await
+        Self::new_with_sinks(cfg, event_tx, archive, Vec::new()).await
     }
 
     /// Builds the speaker with every optional sink attached.
@@ -536,7 +537,7 @@ impl BgpService {
         cfg: &FoclConfig,
         event_tx: broadcast::Sender<EventEnvelope>,
         archive: Option<Arc<ArchiveService>>,
-        bmp: Option<ExportHandle>,
+        bmp: Vec<ExportHandle>,
     ) -> Result<Self> {
         // `FoclConfig::load` validates, but a config built in code arrives
         // unchecked, and `peer_auth` relies on a peer naming one mechanism.
@@ -935,22 +936,27 @@ impl BgpService {
         // The station learns a peer from this frame, and everything after it is attributed to it.
         // Both OPENs travel verbatim: a station reads the peer's address families, BGP identifier
         // and add-path negotiation out of them.
-        if let Some(bmp) = &self.inner.bmp {
+        if !self.inner.bmp.is_empty() {
             let header = PeerHeader {
                 peer_ip: remote_endpoint.ip(),
                 peer_asn: peer.remote_as,
                 peer_bgp_id: remote_open.bgp_identifier,
                 asn_16bit: matches!(negotiated.asn_length(), AsnLength::Bits16),
             };
-            bmp.peer_up(
-                &peer.address,
-                header,
-                local_endpoint.ip(),
-                local_endpoint.port(),
-                remote_endpoint.port(),
-                sent_open,
-                incoming.raw,
-            );
+            // Peer Up describes the session, not a direction (RFC 8671 §6.3): every station that
+            // carries either direction of this peer needs it before any frame arrives.
+            let received_open = incoming.raw;
+            for bmp in &self.inner.bmp {
+                bmp.peer_up(
+                    &peer.address,
+                    header.clone(),
+                    local_endpoint.ip(),
+                    local_endpoint.port(),
+                    remote_endpoint.port(),
+                    sent_open.clone(),
+                    received_open.clone(),
+                );
+            }
         }
         // Register this session and send its initial table in one critical
         // section under the mutation lock: a concurrent add/remove landing
@@ -980,7 +986,8 @@ impl BgpService {
             // session as still converging.
             for eor_family in [Afi::Ipv4, Afi::Ipv6] {
                 if negotiated.carries(eor_family, Safi::Unicast) {
-                    write_bgp_message(
+                    self.write_own_update(
+                        peer,
                         &mut writer,
                         &end_of_rib(eor_family),
                         negotiated.asn_length(),
@@ -1029,8 +1036,11 @@ impl BgpService {
                                 // Forwarded before parsing effects anything: the station receives
                                 // the PDU as it arrived, which is the only way an attribute this
                                 // build does not model survives the export.
-                                if let Some(bmp) = &self.inner.bmp {
-                                    bmp.frame(&peer.address, &message.raw, bmp_wire::now_micros());
+                                if !self.inner.bmp.is_empty() {
+                                    let at = bmp_wire::now_micros();
+                                    for bmp in &self.inner.bmp {
+                                        bmp.frame(&peer.address, &message.raw, at);
+                                    }
                                 }
                                 self.ingest_received_update(
                                     peer,
@@ -1147,7 +1157,8 @@ impl BgpService {
         );
         self.emit_updates(peer, writer, negotiated, local_ip, local_as, updates)
             .await?;
-        write_bgp_message(writer, &end_of_rib(afi), negotiated.asn_length()).await?;
+        self.write_own_update(peer, writer, &end_of_rib(afi), negotiated.asn_length())
+            .await?;
         Ok(())
     }
 
@@ -1174,6 +1185,28 @@ impl BgpService {
         }
     }
 
+    /// Writes one of our own UPDATE and mirrors it to the Adj-RIB-Out stations.
+    ///
+    /// Every path that changes what a session announces goes through here, because a station told
+    /// about some of our announcements and not others cannot tell which of its rows are missing,
+    /// and the frame it receives is the PDU that went out, O-flagged so it is filed as outbound.
+    async fn write_own_update<W: AsyncWrite + Unpin>(
+        &self,
+        peer: &PeerConfig,
+        writer: &mut W,
+        message: &BgpMessage,
+        asn_len: AsnLength,
+    ) -> Result<Vec<u8>> {
+        let raw = write_bgp_message(writer, message, asn_len).await?;
+        if !self.inner.bmp.is_empty() {
+            let at = bmp_wire::now_micros();
+            for bmp in &self.inner.bmp {
+                bmp.frame_out(&peer.address, &raw, at);
+            }
+        }
+        Ok(raw)
+    }
+
     /// Writes updates to one session and mirrors them into the archive. The
     /// archive is receive-only for a collector, so our own announcements are
     /// recorded here to keep a self-contained lab archive complete; they are
@@ -1190,7 +1223,9 @@ impl BgpService {
     ) -> Result<()> {
         let asn_len = negotiated.asn_length();
         for update in updates {
-            let raw = write_bgp_message(writer, &update, asn_len).await?;
+            let raw = self
+                .write_own_update(peer, writer, &update, asn_len)
+                .await?;
             if let Some(archive) = &self.inner.archive {
                 archive
                     .ingest_local_update(UpdateRecordInput {
@@ -1384,12 +1419,9 @@ impl BgpService {
         {
             return;
         }
-        if let Some(bmp) = &self.inner.bmp {
-            bmp.peer_down(
-                address,
-                bmp_wire::PEER_DOWN_REMOTE_NO_DATA,
-                bmp_wire::now_micros(),
-            );
+        let at = bmp_wire::now_micros();
+        for bmp in &self.inner.bmp {
+            bmp.peer_down(address, bmp_wire::PEER_DOWN_REMOTE_NO_DATA, at);
         }
     }
 

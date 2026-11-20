@@ -34,7 +34,12 @@ pub const MSG_INITIATION: u8 = 4;
 const PEER_TYPE_GLOBAL: u8 = 0;
 
 const FLAG_IPV6: u8 = 0x80;
+/// Post-policy (RFC 9069). An Adj-RIB-Out frame carries it because the PDU is what was actually
+/// transmitted, which is what RFC 8671 §5.1 requires the flag to say.
+const FLAG_POST_POLICY: u8 = 0x40;
 const FLAG_AS_16BIT: u8 = 0x20;
+/// Adj-RIB-Out (RFC 8671 §4). Redefines the peer fields as the peer the PDU is sent *to*.
+const FLAG_ADJ_RIB_OUT: u8 = 0x10;
 
 /// Peer Down reasons used by this exporter. Both carry no payload, so a station can parse the
 /// frame without knowing anything about focl's FSM.
@@ -88,9 +93,13 @@ fn common_header(msg_type: u8, body_len: usize) -> Vec<u8> {
 }
 
 fn per_peer_header(peer: &PeerHeader, at_micros: i64) -> Vec<u8> {
+    per_peer_header_with_flags(peer, 0, at_micros)
+}
+
+fn per_peer_header_with_flags(peer: &PeerHeader, extra: u8, at_micros: i64) -> Vec<u8> {
     let mut out = Vec::with_capacity(42);
     out.push(PEER_TYPE_GLOBAL);
-    out.push(peer.flags());
+    out.push(peer.flags() | extra);
     // Peer distinguisher: zero for a global instance peer.
     out.extend_from_slice(&0u64.to_be_bytes());
     match peer.peer_ip {
@@ -183,7 +192,32 @@ pub fn peer_down(peer: &PeerHeader, reason: u8, at_micros: i64) -> Vec<u8> {
 /// End-of-RIB marker) is a legal Route Monitoring frame and is how a station learns the peer's
 /// initial table finished.
 pub fn route_monitoring(peer: &PeerHeader, pdu: &[u8], at_micros: i64) -> Vec<u8> {
-    let mut body = per_peer_header(peer, at_micros);
+    route_monitoring_with_extra_flags(peer, 0, pdu, at_micros)
+}
+
+/// Wraps one of our own UPDATEs: what this peer was actually sent.
+///
+/// Two flags differ from the inbound case and both are load-bearing (RFC 8671):
+///
+/// - `O` redefines the peer fields as the peer the PDU went to, which is why one announcement to
+///   three peers is three frames and never one.
+/// - `L` says the PDU is what was transmitted after outbound policy. focl applies none, so what it
+///   built is what went out; claiming pre-policy here would tell a station that the next hop in
+///   this frame is not necessarily the one the peer saw.
+///
+/// Peer Up, Peer Down and Statistics Report deliberately keep `O` clear: RFC 8671 §6.3 has
+/// receivers ignore the flag there, and §6.2 requires it zero on a Statistics Report.
+pub fn route_monitoring_adj_out(peer: &PeerHeader, pdu: &[u8], at_micros: i64) -> Vec<u8> {
+    route_monitoring_with_extra_flags(peer, FLAG_ADJ_RIB_OUT | FLAG_POST_POLICY, pdu, at_micros)
+}
+
+fn route_monitoring_with_extra_flags(
+    peer: &PeerHeader,
+    extra: u8,
+    pdu: &[u8],
+    at_micros: i64,
+) -> Vec<u8> {
+    let mut body = per_peer_header_with_flags(peer, extra, at_micros);
     body.extend_from_slice(pdu);
     let mut out = common_header(MSG_ROUTE_MONITORING, body.len());
     out.extend_from_slice(&body);
@@ -346,6 +380,38 @@ mod tests {
         let frame = route_monitoring(&peer, &pdu, 1_700_000_000_000_000);
         let body_at = 6 + 42;
         assert_eq!(&frame[body_at..], &pdu[..]);
+    }
+
+    #[test]
+    fn an_adj_rib_out_frame_carries_o_and_l_and_nothing_else_changes() {
+        let peer = peer();
+        let mut pdu = open_pdu(64500, 90);
+        pdu[18] = 4;
+        let frame = route_monitoring_adj_out(&peer, &pdu, 1_700_000_000_000_000);
+        let parsed = parse(&frame);
+        let header = parsed
+            .per_peer_header
+            .expect("route monitoring has a header");
+        let flags = match header.peer_flags {
+            bgpkit_parser::bmp::messages::PerPeerFlags::PeerFlags(flags) => flags,
+            other => panic!("expected peer flags, got {other:?}"),
+        };
+        assert!(flags.is_adj_rib_out());
+        assert!(flags.is_post_policy());
+        // The O flag redefines the peer fields as the peer the PDU went to; this frame is still
+        // attributed to the same peer, so the values must match the inbound case exactly.
+        assert_eq!(header.peer_asn.to_u32(), 64500);
+        assert_eq!(header.peer_ip, "192.0.2.7".parse::<IpAddr>().unwrap());
+        // The payload is untouched: an export that re-encoded the PDU would have changed it.
+        assert_eq!(&frame[6 + 42..], &pdu[..]);
+    }
+
+    #[test]
+    fn a_statistics_report_never_carries_the_o_flag() {
+        // RFC 8671 §6.2: the O flag MUST be zero on a Statistics Report, whatever the station is
+        // being fed.
+        let frame = statistics_report(&peer(), 1_700_000_000_000_000);
+        assert_eq!(frame[6 + 1] & FLAG_ADJ_RIB_OUT, 0);
     }
 
     #[test]

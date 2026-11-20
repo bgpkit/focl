@@ -33,7 +33,7 @@ The project consists of:
 - [x] Active and passive peer modes
 - [x] Route refresh capability
 - [x] MRT archive support (BGP4MP, TableDumpV2)
-- [x] BMP export to a monitoring station (RFC 7854, `docs/bmp-export.md`)
+- [x] BMP export of both directions to a monitoring station (RFC 7854, Adj-RIB-Out per RFC 8671; `docs/bmp-export.md`)
 - [x] S3 and local replication destinations
 - [x] CLI control via Unix Domain Socket
 

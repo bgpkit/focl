@@ -45,6 +45,10 @@ pub struct BmpExportSettings {
     /// Peer names to export. Empty means every peer that comes up.
     pub peers: Vec<String>,
     pub queue: usize,
+    /// What this connection carries: `false` for what the peers sent us (pre-policy Adj-RIB-In),
+    /// `true` for what we sent them (Adj-RIB-Out, RFC 8671). One connection carries one of them,
+    /// because a station records one view per connection.
+    pub rib_out: bool,
 }
 
 impl BmpExportSettings {
@@ -140,9 +144,25 @@ impl ExportHandle {
         });
     }
 
-    /// Forwards one inbound UPDATE exactly as it arrived.
+    /// Forwards one inbound UPDATE exactly as it arrived. Ignored by an Adj-RIB-Out connection.
     pub fn frame(&self, key: &str, pdu: &[u8], at_micros: i64) {
-        if !self.exports(key) {
+        if self.settings.rib_out || !self.exports(key) {
+            return;
+        }
+        self.offer(Item::Frame {
+            key: key.to_string(),
+            pdu: pdu.to_vec(),
+            at_micros,
+        });
+    }
+
+    /// Forwards one of our own UPDATEs, as sent to this peer. Ignored by an inbound connection.
+    ///
+    /// The same announcement reaches every peer as its own frame because the O flag makes the
+    /// per-peer header mean "the peer this PDU went to"; a station cannot split one frame between
+    /// two peers.
+    pub fn frame_out(&self, key: &str, pdu: &[u8], at_micros: i64) {
+        if !self.settings.rib_out || !self.exports(key) {
             return;
         }
         self.offer(Item::Frame {
@@ -318,7 +338,12 @@ async fn pump(
                 let Some(header) = announced.get(&key) else {
                     continue;
                 };
-                write_frame(stream, &wire::route_monitoring(header, &pdu, at_micros)).await?;
+                let frame = if settings.rib_out {
+                    wire::route_monitoring_adj_out(header, &pdu, at_micros)
+                } else {
+                    wire::route_monitoring(header, &pdu, at_micros)
+                };
+                write_frame(stream, &frame).await?;
             }
             Ok(None) => return Ok(()),
             Err(_) => {
@@ -377,6 +402,7 @@ mod tests {
             stats_interval_secs: 60,
             peers: vec![],
             queue: 64,
+            rib_out: false,
         }
     }
 
@@ -525,6 +551,46 @@ mod tests {
             open_pdu(64500),
         );
         assert_eq!(handle.live_peers(), 0);
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn an_adj_rib_out_connection_carries_o_flagged_frames_and_no_inbound_ones() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let station = listener.local_addr().unwrap();
+        let mut cfg = settings(&station.to_string());
+        cfg.rib_out = true;
+        let handle = BmpExporter::spawn(cfg).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_frames(&mut stream, 1).await;
+
+        handle.peer_up(
+            "198.51.100.1",
+            header(),
+            "192.0.2.1".parse().unwrap(),
+            179,
+            51234,
+            open_pdu(65001),
+            open_pdu(64500),
+        );
+        let mut pdu = open_pdu(64500);
+        pdu[18] = 4;
+        // Neither direction may leak into the other's connection: the station files whatever
+        // arrives under the view it configured for this port.
+        handle.frame("198.51.100.1", &pdu, 1_700_000_000_000_000);
+        handle.frame_out("198.51.100.1", &pdu, 1_700_000_000_000_000);
+
+        let frames = read_frames(&mut stream, 2).await;
+        assert!(matches!(
+            parse(&frames[0]).message_body,
+            BmpMessageBody::PeerUpNotification(_)
+        ));
+        let route = parse(&frames[1]);
+        let flags = match route.per_peer_header.expect("header").peer_flags {
+            bgpkit_parser::bmp::messages::PerPeerFlags::PeerFlags(flags) => flags,
+            other => panic!("expected peer flags, got {other:?}"),
+        };
+        assert!(flags.is_adj_rib_out());
         drop(handle);
     }
 

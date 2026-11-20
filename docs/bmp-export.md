@@ -11,6 +11,10 @@ the speaker is how one daemon ends up with two writers on one archive root.
 
 ## What is exported
 
+A station records one view per connection, so each direction of the same session is its own
+`[[bmp.stations]]` entry: what the peers sent us (Adj-RIB-In) and, if you ask for it, what we sent
+them (Adj-RIB-Out, RFC 8671).
+
 Per live peer, and only this:
 
 * **Peer Up** when the session reaches Established, carrying both OPEN PDUs exactly as they crossed
@@ -31,16 +35,31 @@ set. The `V` flag follows the peer's address family, and the `A` flag follows th
 AS_PATH width, because a station reads the AS_PATH using that flag and a wrong one misreads every
 path.
 
+On a `rib_out = true` connection the same frames describe the other direction: every UPDATE we
+send a peer, one frame per peer, flagged `O` (RFC 8671) so the station knows the peer fields mean
+"the peer this was sent to", and `L` because the PDU is exactly what went out (focl applies no
+outbound policy, so its Adj-RIB-Out is already post-policy). Peer Up, Peer Down and Statistics
+Reports keep `O` clear: RFC 8671 has receivers ignore it there and requires it zero on a
+Statistics Report.
+
 ## Configuration
 
 ```toml
 [bmp]
 enabled = true
-station = "203.0.113.20:1790"   # the station's address; focl dials
 sys_name = "focl-edge01"       # what the station records as this feed's identity
 stats_interval_secs = 60       # shorter than any idle timeout on the path
-peers = ["edge-router"]        # optional: peer names or addresses; empty exports them all
 queue_frames = 65536           # frames that may wait before the session is dropped
+
+# What the peers sent us.
+[[bmp.stations]]
+address = "203.0.113.20:1790"   # the station's address; focl dials
+peers = ["edge-router"]        # optional: peer names or addresses; empty exports them all
+
+# What we sent them. A separate connection, because the station records one view per port.
+[[bmp.stations]]
+address = "203.0.113.20:1791"
+rib_out = true
 ```
 
 The station side, for a `bgpviews.toml`:
@@ -55,6 +74,16 @@ feed = "bmp"
 [clients.view]
 name = "adj-in-pre"
 updates_interval_minutes = 1
+
+[[clients]]
+name = "focl-out"
+listen = "203.0.113.20:1791"
+allow_from = ["198.51.100.10/32"]
+feed = "bmp"
+
+[clients.view]
+name = "adj-out"
+updates_interval_minutes = 1
 ```
 
 ## What it does not do, and why
@@ -65,8 +94,8 @@ updates_interval_minutes = 1
   station's own coverage record shows the peer without a baseline. Synthesising the table from
   focl's RIB would be worse than the hole, because the RIB holds only next hop, AS path and origin,
   and a station cannot tell a reconstructed path from an observed one.
-* **No Adj-RIB-Out.** Our own announcements are archived locally with the `*_LOCAL` BGP4MP subtype;
-  exporting them as BMP would need the `O` flag (RFC 8671) and a station-side view of its own.
+* **No pre-policy Adj-RIB-Out.** The `L` flag is always set on an outbound frame because focl
+  transmits everything it builds, so there is no pre-policy stage to describe.
 * **No Route Mirroring, no add-path marking.** The station decides what it can accept from the
   OPENs it is given.
 * **No authentication.** RFC 7854 defines none: the credential is the source address, which the

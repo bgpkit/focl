@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
-# Does a real bgpviews archiving a real focl session produce the session's routes?
+# Does a real bgpviews archive both directions of a real focl session, and keep them apart?
 #
 # Three processes, one chain, nothing simulated:
-#   focld "b"  AS65002 originates two networks toward a peer
-#   focld "a"  AS65001 is that peer; it exports what it received over BMP
-#   bgpviews   listens as the station and writes MRT
+#   focld "b"  AS65002 originates two networks toward its peer
+#   focld "a"  AS65001 is that peer, originates two of its own, and exports both directions
+#   bgpviews   listens twice: one client records what a received (adj-in-pre), one what a sent
+#              (adj-out, the RFC 8671 O flag)
 #
-# The check is the archive, not the daemon: what bgpviews wrote must contain the two networks
-# with focld b's origin AS, and `bgpviews verify` must call the tree clean.
+# The check is the archive, not the daemon, and the two directions carry *different* networks on
+# purpose: an archive that mixed them would still parse, so only the content proves the split.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-FOCL_REPO=${FOCL_REPO:-/root/Git/bgpkit-git/focl}
+FOCL_REPO=${FOCL_REPO:-$(cd ../.. && pwd)}
 VIEWS_REPO=${VIEWS_REPO:-/root/Git/bgpkit-git/bgpviews}
 A_PORT=${A_PORT:-17961}
-STATION_PORT=${STATION_PORT:-17962}
+IN_PORT=${IN_PORT:-17962}
+OUT_PORT=${OUT_PORT:-17963}
 
 echo "== building =="
 # Each repository decides its own target directory, so read the path cargo reports instead of
 # assuming `<repo>/target`.
 built() {
-  (cd "$1" && cargo build --release --bin "$2" --message-format=json 2>/dev/null)     | grep -o "\"executable\":\"[^\"]*\"" | tail -1 | sed 's/.*:"//; s/"$//'
+  (cd "$1" && cargo build --release --bin "$2" --message-format=json 2>/dev/null) | grep -o '"executable":"[^"]*"' | tail -1 | sed 's/.*:"//; s/"$//'
 }
 FOCLD=$(built "$FOCL_REPO" focld)
 FOCL_CLI=$(built "$FOCL_REPO" focl)
@@ -52,12 +54,28 @@ remote_port = ${A_PORT}
 passive = true
 enabled = true
 
+# This daemon's own announcements: what the adj-out station is supposed to see.
+[[prefixes]]
+network = "203.0.113.0/24"
+
+[[prefixes]]
+network = "2001:db8:aa::/48"
+next_hop = "2001:db8:aa::1"
+
 [bmp]
 enabled = true
-station = "127.0.0.1:${STATION_PORT}"
 sys_name = "focl-a"
 stats_interval_secs = 5
 queue_frames = 65536
+
+# One entry per station connection: a station records one view per listening port, so the two
+# directions are two connections.
+[[bmp.stations]]
+address = "127.0.0.1:${IN_PORT}"
+
+[[bmp.stations]]
+address = "127.0.0.1:${OUT_PORT}"
+rib_out = true
 
 [archive]
 enabled = false
@@ -97,13 +115,24 @@ cat > run/station/bgpviews.toml <<TOML
 root = "${RUN}/station/archive"
 
 [[clients]]
-name = "focl"
-listen = "127.0.0.1:${STATION_PORT}"
+name = "focl-in"
+listen = "127.0.0.1:${IN_PORT}"
 allow_from = ["127.0.0.1/32"]
 feed = "bmp"
 
 [clients.view]
 name = "adj-in-pre"
+updates_interval_minutes = 1
+rib = true
+
+[[clients]]
+name = "focl-out"
+listen = "127.0.0.1:${OUT_PORT}"
+allow_from = ["127.0.0.1/32"]
+feed = "bmp"
+
+[clients.view]
+name = "adj-out"
 updates_interval_minutes = 1
 rib = true
 TOML
@@ -114,7 +143,7 @@ VIEWS_PID=$!
 sleep 1
 kill -0 "$VIEWS_PID" 2>/dev/null || { echo "FAIL: bgpviews did not start"; cat run/station/bgpviews.log; exit 1; }
 
-echo "== starting focld a (exporter) =="
+echo "== starting focld a (exporter of both directions) =="
 "$FOCLD" --config run/a/focl.toml > run/a/focld.log 2>&1 &
 A_PID=$!
 sleep 1
@@ -145,45 +174,71 @@ if [ "$ESTABLISHED" != "1" ]; then
 fi
 echo "session established"
 
-# Long enough for both the announcement and the End-of-RIB markers to cross the BMP connection,
-# plus the exporter's own statistics heartbeat.
-sleep 4
+# Long enough for both tables, both End-of-RIB pairs and a statistics heartbeat to cross each BMP
+# connection.
+sleep 5
 echo "== stopping the originator first, so the peer-down path runs =="
 kill "$B_PID" 2>/dev/null || true
 sleep 2
-echo "== stopping the exporter, which ends the BMP session =="
+echo "== stopping the exporter, which ends both BMP sessions =="
 kill "$A_PID" 2>/dev/null || true
-sleep 2
+sleep 3
 kill "$VIEWS_PID" 2>/dev/null || true
 wait 2>/dev/null || true
 trap - EXIT
 
 echo "== bgpviews log =="
 VIEWS_LOG=$(cat run/station/bgpviews.log)
-tail -20 run/station/bgpviews.log
-
-# The station's own counters are the pass condition for everything before the file exists: a Peer
-# Up it refused would leave records at zero, and a missing End-of-RIB would leave that at zero.
-echo "$VIEWS_LOG" | grep -q 'records           4' || { echo "FAIL: expected four records (two routes, two End-of-RIB)"; exit 1; }
-echo "$VIEWS_LOG" | grep -q 'end of rib        2' || { echo "FAIL: the End-of-RIB markers did not reach the station"; exit 1; }
-echo "$VIEWS_LOG" | grep -q 'peer_vanished' || { echo "FAIL: no Peer Down reached the station"; exit 1; }
+tail -45 run/station/bgpviews.log
 
 echo "== archive tree =="
-find run/station/archive -name '*.gz' | sort | head -20
+find run/station/archive -name '*.gz' | sort
 
-UPDATES=$(find run/station/archive -name 'updates.*.gz' | sort | tail -1)
-if [ -z "$UPDATES" ]; then
-  echo "FAIL: the station wrote no updates segment"
+IN_SEG=$(find run/station/archive/focl-in-adj-in-pre -name 'updates.*.gz' 2>/dev/null | sort | tail -1)
+OUT_SEG=$(find run/station/archive/focl-out-adj-out -name 'updates.*.gz' 2>/dev/null | sort | tail -1)
+[ -n "$IN_SEG" ] || { echo "FAIL: the adj-in-pre station wrote no updates segment"; exit 1; }
+[ -n "$OUT_SEG" ] || { echo "FAIL: the adj-out station wrote no updates segment"; exit 1; }
+
+echo "== what the station recorded as received (adj-in-pre) =="
+IN_PARSED=$(monocle parse "$IN_SEG" 2>&1)
+echo "$IN_PARSED"
+echo "== what the station recorded as sent (adj-out) =="
+OUT_PARSED=$(monocle parse "$OUT_SEG" 2>&1)
+echo "$OUT_PARSED"
+
+echo "== the peer's networks arrive on the inbound view, and only there =="
+echo "$IN_PARSED" | grep -q '192.0.2.0/24' || { echo "FAIL: ipv4 network the peer sent is missing from adj-in-pre"; exit 1; }
+echo "$IN_PARSED" | grep -q '2001:db8:99::/48' || { echo "FAIL: ipv6 network the peer sent is missing from adj-in-pre"; exit 1; }
+if echo "$IN_PARSED" | grep -q '203.0.113.0/24'; then
+  echo "FAIL: adj-in-pre carries a network this daemon announced"
   exit 1
 fi
-echo "== parsing $UPDATES =="
-monocle parse "$UPDATES" 2>&1 | head -20
 
-echo "== the archived records must carry the originator's networks =="
-PARSED=$(monocle parse "$UPDATES" 2>&1)
-echo "$PARSED" | grep -q '192.0.2.0/24' || { echo "FAIL: ipv4 network missing from the station's archive"; exit 1; }
-echo "$PARSED" | grep -q '2001:db8:99::/48' || { echo "FAIL: ipv6 network missing from the station's archive"; exit 1; }
-echo "$PARSED" | grep -q '65002' || { echo "FAIL: originator AS missing from the archived path"; exit 1; }
+echo "== our own networks are on the outbound view, and only there =="
+echo "$OUT_PARSED" | grep -q '203.0.113.0/24' || { echo "FAIL: announced ipv4 network is missing from adj-out"; exit 1; }
+echo "$OUT_PARSED" | grep -q '2001:db8:aa::/48' || { echo "FAIL: announced ipv6 network is missing from adj-out"; exit 1; }
+if echo "$OUT_PARSED" | grep -q '192.0.2.0/24'; then
+  echo "FAIL: adj-out carries a network the peer sent us"
+  exit 1
+fi
+
+echo "== the station counted the End-of-RIB markers, the peer-down and no stray view on both =="
+echo "$VIEWS_LOG" | grep -q 'client            focl-in' || { echo "FAIL: no adj-in-pre session in the log"; exit 1; }
+echo "$VIEWS_LOG" | grep -q 'client            focl-out' || { echo "FAIL: no adj-out session in the log"; exit 1; }
+# Both directions carry two families, so each session must account for two End-of-RIB markers.
+[ "$(echo "$VIEWS_LOG" | grep -c 'end of rib        2')" -ge 2 ] || {
+  echo "FAIL: the End-of-RIB markers did not reach both stations"
+  exit 1
+}
+[ "$(echo "$VIEWS_LOG" | grep -c 'peer_vanished')" -ge 2 ] || {
+  echo "FAIL: no Peer Down reached both stations"
+  exit 1
+}
+# A collector that swallowed the other direction's frames would say so here.
+[ "$(echo "$VIEWS_LOG" | grep -c 'unconfigured view 0')" -ge 2 ] || {
+  echo "FAIL: a station counted frames that belong to the other direction"
+  exit 1
+}
 
 echo "== bgpviews verify =="
 "$VIEWS" verify --config run/station/bgpviews.toml

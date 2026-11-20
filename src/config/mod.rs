@@ -30,9 +30,11 @@ pub struct FoclConfig {
 pub struct BmpConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// The station's `host:port`. Required when `enabled`.
+    /// One connection per station. Two stations may carry the two directions of the same session:
+    /// what the peers sent us (Adj-RIB-In) and what we sent them (Adj-RIB-Out), which a station
+    /// records under different views and therefore as different connections.
     #[serde(default)]
-    pub station: Option<String>,
+    pub stations: Vec<BmpStationConfig>,
     /// Exporter name the station records as this feed's identity.
     #[serde(default = "default_bmp_sys_name")]
     pub sys_name: String,
@@ -42,9 +44,6 @@ pub struct BmpConfig {
     /// station behind a stateful firewall needs this shorter than that firewall's idle timeout.
     #[serde(default = "default_bmp_stats_interval")]
     pub stats_interval_secs: u64,
-    /// Peers to export, by configured address or name. Empty exports every peer that comes up.
-    #[serde(default)]
-    pub peers: Vec<String>,
     /// Frames that may wait for the station before the session is dropped. Sized to absorb one
     /// full table: a station that cannot keep up ends the connection, which the archive records as
     /// a gap, rather than losing frames silently or stalling a BGP session.
@@ -56,14 +55,30 @@ impl Default for BmpConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            station: None,
+            stations: Vec::new(),
             sys_name: default_bmp_sys_name(),
             sys_descr: default_bmp_sys_descr(),
             stats_interval_secs: default_bmp_stats_interval(),
-            peers: Vec::new(),
             queue_frames: default_bmp_queue(),
         }
     }
+}
+
+/// One `[[bmp.stations]]` table: a connection this daemon opens to a station.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BmpStationConfig {
+    /// The station's `host:port`.
+    pub address: String,
+    /// What this connection carries. `false` (the default) is pre-policy Adj-RIB-In, what the
+    /// peers sent us. `true` is Adj-RIB-Out (RFC 8671), what we sent them, flagged with `O` and
+    /// `L` so a station can tell it apart from the inbound direction.
+    #[serde(default)]
+    pub rib_out: bool,
+    /// Peers to export on this connection, by configured address or name. Empty exports every
+    /// peer that comes up.
+    #[serde(default)]
+    pub peers: Vec<String>,
 }
 
 fn default_bmp_sys_name() -> String {
@@ -100,16 +115,32 @@ impl FoclConfig {
     /// matches no configured peer would look like a healthy feed of an idle session.
     fn validate_bmp(&self) -> Result<()> {
         if !self.bmp.enabled {
-            if self.bmp.station.is_some() {
-                bail!("[bmp].station is set but [bmp].enabled is false");
+            if !self.bmp.stations.is_empty() {
+                bail!("[[bmp.stations]] is set but [bmp].enabled is false");
             }
             return Ok(());
         }
-        let Some(station) = &self.bmp.station else {
-            bail!("[bmp].enabled requires [bmp].station");
-        };
-        if station.parse::<std::net::SocketAddr>().is_err() {
-            bail!("[bmp].station {station} is not host:port");
+        if self.bmp.stations.is_empty() {
+            bail!("[bmp].enabled requires at least one [[bmp.stations]] entry");
+        }
+        // One connection per station address: a station serves one view per listening port, so a
+        // second connection to the same port would replace the first rather than add a direction.
+        let mut seen: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+        for station in &self.bmp.stations {
+            if station.address.parse::<std::net::SocketAddr>().is_err() {
+                bail!(
+                    "[[bmp.stations]].address {} is not host:port",
+                    station.address
+                );
+            }
+            if let Some(first_rib_out) = seen.insert(station.address.as_str(), station.rib_out) {
+                bail!(
+                    "[[bmp.stations]] names {} twice (rib_out {first_rib_out} and {}); a station \
+                     serves one view per port, so use one entry per direction and port",
+                    station.address,
+                    station.rib_out
+                );
+            }
         }
         if self.bmp.sys_name.trim().is_empty() {
             bail!(
@@ -122,14 +153,17 @@ impl FoclConfig {
         if self.bmp.queue_frames == 0 {
             bail!("[bmp].queue_frames must be at least 1");
         }
-        for wanted in &self.bmp.peers {
-            let known = self.peers.iter().any(|peer| {
-                peer.address == *wanted || peer.name.as_deref() == Some(wanted.as_str())
-            });
-            if !known {
-                bail!(
-                    "[bmp].peers names {wanted}, which is neither a peer address nor a peer name"
-                );
+        for station in &self.bmp.stations {
+            for wanted in &station.peers {
+                let known = self.peers.iter().any(|peer| {
+                    peer.address == *wanted || peer.name.as_deref() == Some(wanted.as_str())
+                });
+                if !known {
+                    bail!(
+                        "[[bmp.stations]].peers names {wanted}, which is neither a peer address \
+                         nor a peer name"
+                    );
+                }
             }
         }
         Ok(())
