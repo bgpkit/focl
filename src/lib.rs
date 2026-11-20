@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod bgp;
+pub mod bmp;
 pub mod config;
 pub mod control;
 pub mod types;

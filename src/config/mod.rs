@@ -15,6 +15,71 @@ pub struct FoclConfig {
     pub prefixes: Vec<PrefixConfig>,
     #[serde(default)]
     pub archive: ArchiveConfig,
+    /// Forwarding what this daemon's sessions see to a monitoring station (RFC 7854).
+    #[serde(default)]
+    pub bmp: BmpConfig,
+}
+
+/// `[bmp]`: forwarding this daemon's sessions to a monitoring station.
+///
+/// The station is a `bgpviews`-style collector, and focl is the exporter: BMP has no
+/// station-initiated mode, so this daemon dials and the station never dials back. Absent this
+/// table, nothing is exported and no socket is opened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BmpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The station's `host:port`. Required when `enabled`.
+    #[serde(default)]
+    pub station: Option<String>,
+    /// Exporter name the station records as this feed's identity.
+    #[serde(default = "default_bmp_sys_name")]
+    pub sys_name: String,
+    #[serde(default = "default_bmp_sys_descr")]
+    pub sys_descr: String,
+    /// Interval between Statistics Reports. They are the only liveness signal BMP offers, so a
+    /// station behind a stateful firewall needs this shorter than that firewall's idle timeout.
+    #[serde(default = "default_bmp_stats_interval")]
+    pub stats_interval_secs: u64,
+    /// Peers to export, by configured address or name. Empty exports every peer that comes up.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// Frames that may wait for the station before the session is dropped. Sized to absorb one
+    /// full table: a station that cannot keep up ends the connection, which the archive records as
+    /// a gap, rather than losing frames silently or stalling a BGP session.
+    #[serde(default = "default_bmp_queue")]
+    pub queue_frames: usize,
+}
+
+impl Default for BmpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            station: None,
+            sys_name: default_bmp_sys_name(),
+            sys_descr: default_bmp_sys_descr(),
+            stats_interval_secs: default_bmp_stats_interval(),
+            peers: Vec::new(),
+            queue_frames: default_bmp_queue(),
+        }
+    }
+}
+
+fn default_bmp_sys_name() -> String {
+    "focl".to_string()
+}
+
+fn default_bmp_sys_descr() -> String {
+    concat!("focl ", env!("CARGO_PKG_VERSION")).to_string()
+}
+
+fn default_bmp_stats_interval() -> u64 {
+    60
+}
+
+fn default_bmp_queue() -> usize {
+    65_536
 }
 
 impl FoclConfig {
@@ -26,6 +91,48 @@ impl FoclConfig {
         cfg.validate()
             .with_context(|| format!("config validation failed for {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Refuses a `[bmp]` table that cannot do what it says.
+    ///
+    /// Every rule here exists because the alternative fails silently: a missing station exports
+    /// nothing, an unparseable one only fails once the daemon is running, and a peer name that
+    /// matches no configured peer would look like a healthy feed of an idle session.
+    fn validate_bmp(&self) -> Result<()> {
+        if !self.bmp.enabled {
+            if self.bmp.station.is_some() {
+                bail!("[bmp].station is set but [bmp].enabled is false");
+            }
+            return Ok(());
+        }
+        let Some(station) = &self.bmp.station else {
+            bail!("[bmp].enabled requires [bmp].station");
+        };
+        if station.parse::<std::net::SocketAddr>().is_err() {
+            bail!("[bmp].station {station} is not host:port");
+        }
+        if self.bmp.sys_name.trim().is_empty() {
+            bail!(
+                "[bmp].sys_name must not be empty; the station records it as this feed's identity"
+            );
+        }
+        if self.bmp.stats_interval_secs == 0 {
+            bail!("[bmp].stats_interval_secs must be at least 1");
+        }
+        if self.bmp.queue_frames == 0 {
+            bail!("[bmp].queue_frames must be at least 1");
+        }
+        for wanted in &self.bmp.peers {
+            let known = self.peers.iter().any(|peer| {
+                peer.address == *wanted || peer.name.as_deref() == Some(wanted.as_str())
+            });
+            if !known {
+                bail!(
+                    "[bmp].peers names {wanted}, which is neither a peer address nor a peer name"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -77,6 +184,8 @@ impl FoclConfig {
             }
             validate_peer_auth(peer)?;
         }
+
+        self.validate_bmp()?;
 
         for prefix in &self.prefixes {
             prefix.network.parse::<IpNet>().with_context(|| {

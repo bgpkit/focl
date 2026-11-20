@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Features
+
+* **BMP export** - a `[bmp]` table makes `focld` dial a monitoring station and report every session it runs: Peer Up with both OPEN PDUs verbatim, every inbound UPDATE as it arrived (End-of-RIB included), a Peer Down when the session ends, and a Statistics Report on a timer as the only liveness signal BMP defines. The station role belongs to a collector such as bgpviews, so focl still does not listen for BMP and `docs/examples.md` example 1 now describes the export instead of a listener that never existed. A station that cannot keep up loses the connection rather than a frame or a BGP session; `docs/bmp-export.md` states what is deliberately not exported. Proven end to end by `scripts/lab/bmp_export.sh` against a real bgpviews archive.
+
 ### Fixes
 
 * **One peer per address** - configuration validation rejects two peers that name the same IP in different spellings (`192.0.2.1` and `::ffff:192.0.2.1`); one inbound connection could otherwise be assigned to either peer while only one of their keys was installed.

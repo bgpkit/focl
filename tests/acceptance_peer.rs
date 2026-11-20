@@ -19,7 +19,7 @@ use focl::bgp::{
     tcp_ao_supported, BgpService, PrefixSource, PrefixStatus, TcpSocketExt, TcpStreamExt,
 };
 use focl::config::{
-    ArchiveConfig, FoclConfig, GlobalConfig, PeerConfig, PrefixConfig, TcpAoAlgorithm,
+    ArchiveConfig, BmpConfig, FoclConfig, GlobalConfig, PeerConfig, PrefixConfig, TcpAoAlgorithm,
     TcpAoKeyConfig,
 };
 use focl::types::{Event, PeerAuthMode, PeerState};
@@ -92,6 +92,8 @@ async fn configured_prefixes_exchange_bidirectionally_and_archive() -> Result<()
             ribs_interval_secs: 900,
             ..ArchiveConfig::default()
         },
+        // These sessions are not exported to a station; `[bmp]` stays off.
+        bmp: BmpConfig::default(),
     };
     let archive = ArchiveService::new(cfg.archive.clone(), Ipv4Addr::new(192, 0, 2, 1)).await?;
     let mut events = archive.subscribe_events();
@@ -248,6 +250,8 @@ async fn rib_snapshot_carries_the_live_adj_rib_in() -> Result<()> {
             tmp_root: archive_root.join(".tmp"),
             ..ArchiveConfig::default()
         },
+        // These sessions are not exported to a station; `[bmp]` stays off.
+        bmp: BmpConfig::default(),
     };
     let archive = ArchiveService::new(cfg.archive.clone(), Ipv4Addr::new(192, 0, 2, 1)).await?;
     let bgp =
@@ -378,6 +382,8 @@ async fn session_end_archives_the_established_to_active_transition() -> Result<(
             tmp_root: archive_root.join(".tmp"),
             ..ArchiveConfig::default()
         },
+        // These sessions are not exported to a station; `[bmp]` stays off.
+        bmp: BmpConfig::default(),
     };
     let archive = ArchiveService::new(cfg.archive.clone(), Ipv4Addr::new(192, 0, 2, 1)).await?;
     let _bgp =
@@ -521,6 +527,8 @@ async fn start_service_with_peers(
             enabled: false,
             ..ArchiveConfig::default()
         },
+        // These sessions are not exported to a station; `[bmp]` stays off.
+        bmp: BmpConfig::default(),
     };
     let (event_tx, _events) = broadcast::channel(16);
     BgpService::new(&cfg, event_tx).await

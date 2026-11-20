@@ -33,6 +33,7 @@ The project consists of:
 - [x] Active and passive peer modes
 - [x] Route refresh capability
 - [x] MRT archive support (BGP4MP, TableDumpV2)
+- [x] BMP export to a monitoring station (RFC 7854, `docs/bmp-export.md`)
 - [x] S3 and local replication destinations
 - [x] CLI control via Unix Domain Socket
 
@@ -42,7 +43,6 @@ The project consists of:
 - [ ] eBGP multihop support
 - [ ] Import/export policy framework
 - [ ] Blackhole route support
-- [ ] BMP exporter
 - [ ] RPKI validation integration
 
 ## Quick Start

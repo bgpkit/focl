@@ -15,71 +15,57 @@ focld --config focl.toml
 focl status        # peers, sessions, open archive files, RSS
 ```
 
-## Example 1: BMP station (the operator path)
+## Example 1: exporting to a monitoring station (the operator path)
 
-Router streams to focl; focl never peers, never announces, only archives.
+A station collects; a speaker reports. focl is the speaker, so it does not listen for BMP: it dials
+the station and forwards the sessions it is running, and the station
+([bgpviews](https://bgpviews.org)) owns the archive. `docs/bmp-export.md` has the full contract,
+including what the export deliberately does not do.
 
 `focl.toml`:
 
 ```toml
 [global]
+asn = 65001
 router_id = "198.51.100.10"        # this box
 control_socket = "/run/focld.sock"
 
-[bmp]
-# bind a management address, not 0.0.0.0; restrict with a firewall
-# allowlist so only known routers can connect
-listen = "198.51.100.10:1790"
-# optional per-router MD5; collector identity comes from this trusted
-# mapping, never from the router's BMP Init sysName
-# [[bmp.routers]]
-# address = "203.0.113.6"
-# collector_id = "edge01"
-# password = "[REDACTED]"
-
-[archive]
+[[peers]]
+name = "edge-router"
+address = "203.0.113.6"
+remote_as = 65000
+passive = true
 enabled = true
-collector_id = "edge01"            # default when no [[bmp.routers]] match
-layout_profile = "routeviews"
-updates_interval_secs = 900        # RV-style 15-minute update files
-ribs_interval_secs = 7200          # 2-hour RIB dumps, RV convention
-compression = "zstd"
-root = "/data/mrt"
-retention_days = 30                # local auto-cleanup after replication
 
-[[archive.destinations]]
-type = "local"
-mode = "primary"
-path = "/data/mrt"
+[bmp]
+enabled = true
+station = "198.51.100.20:1790"     # the station dials nobody; we dial it
+sys_name = "focl-edge01"          # the identity the archive records
+stats_interval_secs = 60
+# peers = ["edge-router"]         # empty exports every established peer
 ```
 
-Router side, one stanza each:
+Station side, `bgpviews.toml`:
 
-```text
-# FRR
-bmp monitor all stats-all pre-policy vrf default
-bmp station target 198.51.100.10 port 1790
+```toml
+[[clients]]
+name = "focl"
+listen = "198.51.100.20:1790"
+allow_from = ["198.51.100.10/32"]  # the daemon's source address; BMP has no authentication
+feed = "bmp"
 
-# Juniper
-set protocols bmp station focl connection-mode active test-route-station
-set protocols bmp station focl station-address 198.51.100.10 station-port 1790
-set protocols bmp station focl route-monitor post-policy false
-
-# Cisco IOS-XR
-bmp server 1 host 198.51.100.10 port 1790
-router bgp 65000 bmp server 1 route-monitor pre-policy
-
-# GoBGP (test lab)
-[bmp-server.config]
-  server-address = "198.51.100.10:1790"
+[clients.view]
+name = "adj-in-pre"
+updates_interval_minutes = 1
 ```
 
 Verify:
 
 ```bash
-focl doctor          # router connected, Peer Up seen, EoR walk complete
-focl tail --updates  # live NDJSON of archived elements
-ls /data/mrt/edge01/2026.08/UPDATES/   # updates.20260820.1645.zst
+focl peer show                                    # our session to the router is established
+ss -tnp | grep 1790                               # one established connection to the station
+bgpviews status --config bgpviews.toml            # coverage, records and the End-of-RIB count
+monocle parse /data/mrt/focl-adj-in-pre/bgpdata/2026.08/UPDATES/updates.*.gz
 ```
 
 ## Example 2: incoming BGP peering (the lab/research path)

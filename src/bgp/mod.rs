@@ -26,6 +26,8 @@ use crate::archive::types::{
     PeerStateRecordInput, RibSnapshotInput, SnapshotPeer, SnapshotRoute, UpdateRecordInput,
 };
 use crate::archive::{ArchiveService, RibSnapshotSource, SnapshotInputFuture};
+use crate::bmp::wire::{self as bmp_wire, PeerHeader};
+use crate::bmp::ExportHandle;
 use crate::config::{FoclConfig, PeerConfig, TcpAoKeyConfig};
 use crate::types::{Event, EventEnvelope, PeerAuthMode, PeerState};
 
@@ -496,6 +498,8 @@ struct BgpServiceInner {
     session_local_ips: RwLock<HashMap<String, IpAddr>>,
     event_tx: broadcast::Sender<EventEnvelope>,
     archive: Option<Arc<ArchiveService>>,
+    /// Set when `[bmp]` names a station: every session then forwards what it received.
+    bmp: Option<ExportHandle>,
 }
 
 #[derive(Debug)]
@@ -520,6 +524,19 @@ impl BgpService {
         cfg: &FoclConfig,
         event_tx: broadcast::Sender<EventEnvelope>,
         archive: Option<Arc<ArchiveService>>,
+    ) -> Result<Self> {
+        Self::new_with_sinks(cfg, event_tx, archive, None).await
+    }
+
+    /// Builds the speaker with every optional sink attached.
+    ///
+    /// The BMP handle is a sink like the archive: sessions hand frames to it and never wait for it,
+    /// so a station that is down costs frames from that station's view, not session progress.
+    pub async fn new_with_sinks(
+        cfg: &FoclConfig,
+        event_tx: broadcast::Sender<EventEnvelope>,
+        archive: Option<Arc<ArchiveService>>,
+        bmp: Option<ExportHandle>,
     ) -> Result<Self> {
         // `FoclConfig::load` validates, but a config built in code arrives
         // unchecked, and `peer_auth` relies on a peer naming one mechanism.
@@ -547,6 +564,7 @@ impl BgpService {
             session_local_ips: RwLock::new(HashMap::new()),
             event_tx,
             archive,
+            bmp,
         });
         let service = Self { inner };
         service.start_peers(&cfg.peers).await;
@@ -843,6 +861,10 @@ impl BgpService {
         stream: TcpStream,
         local_ip: IpAddr,
     ) -> Result<()> {
+        // A BMP Peer Up describes the two socket endpoints of the session, and only the socket
+        // knows them: capture both before the split.
+        let local_endpoint = stream.local_addr()?;
+        let remote_endpoint = stream.peer_addr()?;
         let (reader, mut writer) = stream.into_split();
         // One task owns framing, so a runtime operation can never cancel a
         // partially consumed read: `read_exact` is not cancel-safe, and the
@@ -878,7 +900,9 @@ impl BgpService {
             peer.hold_time_secs,
             peer.route_refresh,
         );
-        write_bgp_message(&mut writer, &open, AsnLength::Bits32).await?;
+        // Kept for the station: a Peer Up carries our own OPEN PDU verbatim, and re-encoding it
+        // later would describe a different session than the one that came up.
+        let sent_open = write_bgp_message(&mut writer, &open, AsnLength::Bits32).await?;
 
         let incoming = next_bgp_message(&mut msg_rx).await?;
         let BgpMessage::Open(remote_open) = incoming.message else {
@@ -908,6 +932,26 @@ impl BgpService {
             Some(chrono::Utc::now().timestamp()),
         )
         .await;
+        // The station learns a peer from this frame, and everything after it is attributed to it.
+        // Both OPENs travel verbatim: a station reads the peer's address families, BGP identifier
+        // and add-path negotiation out of them.
+        if let Some(bmp) = &self.inner.bmp {
+            let header = PeerHeader {
+                peer_ip: remote_endpoint.ip(),
+                peer_asn: peer.remote_as,
+                peer_bgp_id: remote_open.bgp_identifier,
+                asn_16bit: matches!(negotiated.asn_length(), AsnLength::Bits16),
+            };
+            bmp.peer_up(
+                &peer.address,
+                header,
+                local_endpoint.ip(),
+                local_endpoint.port(),
+                remote_endpoint.port(),
+                sent_open,
+                incoming.raw,
+            );
+        }
         // Register this session and send its initial table in one critical
         // section under the mutation lock: a concurrent add/remove landing
         // between the snapshot and the registration would otherwise never
@@ -982,6 +1026,12 @@ impl BgpService {
                     match incoming {
                         Ok(Some(Ok(message))) => match message.message {
                             BgpMessage::Update(update) => {
+                                // Forwarded before parsing effects anything: the station receives
+                                // the PDU as it arrived, which is the only way an attribute this
+                                // build does not model survives the export.
+                                if let Some(bmp) = &self.inner.bmp {
+                                    bmp.frame(&peer.address, &message.raw, bmp_wire::now_micros());
+                                }
                                 self.ingest_received_update(
                                     peer,
                                     local_as,
@@ -1319,6 +1369,28 @@ impl BgpService {
                 state,
             }));
         self.archive_peer_state(address, old_state, state).await;
+        self.export_peer_close(address, old_state, state);
+    }
+
+    /// Closes a monitored peer the moment it stops being Established.
+    ///
+    /// Skipping this is the failure a station cannot detect: it keeps reporting the peer's last
+    /// known table, which then looks like a quiet network rather than a lost session. Reason 4 is
+    /// RFC 7854's "remote system closed without a notification", which is what an unexpected
+    /// transport end looks like from here.
+    fn export_peer_close(&self, address: &str, old_state: PeerState, new_state: PeerState) {
+        if !matches!(old_state, PeerState::Established)
+            || matches!(new_state, PeerState::Established)
+        {
+            return;
+        }
+        if let Some(bmp) = &self.inner.bmp {
+            bmp.peer_down(
+                address,
+                bmp_wire::PEER_DOWN_REMOTE_NO_DATA,
+                bmp_wire::now_micros(),
+            );
+        }
     }
 
     async fn archive_peer_state(&self, address: &str, old_state: PeerState, new_state: PeerState) {

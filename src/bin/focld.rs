@@ -7,6 +7,7 @@ use clap::Parser;
 use focl::archive::types::ArchiveStream;
 use focl::archive::ArchiveService;
 use focl::bgp::BgpService;
+use focl::bmp::export::{BmpExportSettings, BmpExporter};
 use focl::config::FoclConfig;
 use focl::control::{
     ArchiveRolloverArgs, ArchiveStatusResult, CommandKind, PeerKeyArgs, PrefixMutationArgs,
@@ -39,7 +40,33 @@ async fn main() -> Result<()> {
 
     let archive = ArchiveService::new(cfg.archive.clone(), collector_bgp_id).await?;
     let events_tx = archive.event_sender();
-    let bgp = BgpService::new_with_archive(&cfg, events_tx, Some(Arc::clone(&archive))).await?;
+    // A station that is configured but unreachable is the daemon's problem to log, not a reason to
+    // refuse to speak BGP: the exporter task retries and the sessions are unaffected.
+    let bmp = if cfg.bmp.enabled {
+        let StationSettings {
+            station,
+            peers,
+            queue,
+        } = station_settings(&cfg)?;
+        let handle = BmpExporter::spawn(BmpExportSettings {
+            station: station.clone(),
+            sys_name: cfg.bmp.sys_name.clone(),
+            sys_descr: cfg.bmp.sys_descr.clone(),
+            stats_interval_secs: cfg.bmp.stats_interval_secs,
+            peers,
+            queue,
+        })?;
+        tracing::info!(
+            station = %station,
+            sys_name = %cfg.bmp.sys_name,
+            stats_interval_secs = cfg.bmp.stats_interval_secs,
+            "exporting to a BMP station"
+        );
+        Some(handle)
+    } else {
+        None
+    };
+    let bgp = BgpService::new_with_sinks(&cfg, events_tx, Some(Arc::clone(&archive)), bmp).await?;
     // The speaker is the archive's RIB view source: a snapshot reads the live
     // Adj-RIB-In from the service that owns it.
     archive.set_snapshot_source(Arc::new(bgp.clone()));
@@ -79,6 +106,41 @@ async fn main() -> Result<()> {
     cleanup_socket(&socket_path)?;
 
     Ok(())
+}
+
+/// `[bmp]` resolved into what the exporter needs.
+///
+/// `[bmp].peers` may name a peer by its configured address or by its `name`; sessions are keyed by
+/// address, so names are resolved once here rather than on every frame.
+struct StationSettings {
+    station: String,
+    peers: Vec<String>,
+    queue: usize,
+}
+
+fn station_settings(cfg: &FoclConfig) -> Result<StationSettings> {
+    let station = cfg
+        .bmp
+        .station
+        .clone()
+        .context("[bmp].enabled requires [bmp].station")?;
+    let mut peers = Vec::with_capacity(cfg.bmp.peers.len());
+    for wanted in &cfg.bmp.peers {
+        let address = cfg
+            .peers
+            .iter()
+            .find(|peer| peer.address == *wanted || peer.name.as_deref() == Some(wanted.as_str()))
+            .map(|peer| peer.address.clone())
+            .with_context(|| {
+                format!("[bmp].peers names {wanted}, which is not a configured peer")
+            })?;
+        peers.push(address);
+    }
+    Ok(StationSettings {
+        station,
+        peers,
+        queue: cfg.bmp.queue_frames,
+    })
 }
 
 fn init_tracing(level: &str) {
