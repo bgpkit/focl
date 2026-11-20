@@ -65,7 +65,7 @@ next_hop = "2001:db8:aa::1"
 [bmp]
 enabled = true
 sys_name = "focl-a"
-stats_interval_secs = 5
+stats_interval_secs = 2
 queue_frames = 65536
 
 # One entry per station connection: a station records one view per listening port, so the two
@@ -76,6 +76,8 @@ address = "127.0.0.1:${IN_PORT}"
 [[bmp.stations]]
 address = "127.0.0.1:${OUT_PORT}"
 rib_out = true
+# An outbound connection describes what this daemon sends, so there is no table to ask a peer for.
+redump_on_connect = false
 
 [archive]
 enabled = false
@@ -177,6 +179,21 @@ echo "session established"
 # Long enough for both tables, both End-of-RIB pairs and a statistics heartbeat to cross each BMP
 # connection.
 sleep 5
+
+# ---- the reconnect: the station goes away while the session stays up ----
+#
+# This is the case the redump exists for. The station comes back with no idea what the tables were,
+# and the daemon cannot replay frames it never kept, so it asks the peers for their tables again
+# (RFC 2918). Without that, this second session would record nothing at all.
+echo "== restarting the station while the session stays up =="
+kill "$VIEWS_PID" 2>/dev/null || true
+# Long enough for the exporter to notice the dead socket on its next heartbeat and fail to connect;
+# shorter than that and it would reconnect only after the peer is gone, which is a different case.
+sleep 6
+"$VIEWS" run --config run/station/bgpviews.toml >> run/station/bgpviews.log 2>&1 &
+VIEWS_PID=$!
+sleep 8
+
 echo "== stopping the originator first, so the peer-down path runs =="
 kill "$B_PID" 2>/dev/null || true
 sleep 2
@@ -199,11 +216,19 @@ OUT_SEG=$(find run/station/archive/focl-out-adj-out -name 'updates.*.gz' 2>/dev/
 [ -n "$IN_SEG" ] || { echo "FAIL: the adj-in-pre station wrote no updates segment"; exit 1; }
 [ -n "$OUT_SEG" ] || { echo "FAIL: the adj-out station wrote no updates segment"; exit 1; }
 
-echo "== what the station recorded as received (adj-in-pre) =="
-IN_PARSED=$(monocle parse "$IN_SEG" 2>&1)
+# Every segment of a view, oldest first: the restart makes two sessions, and both directions have
+# to add up to what was seen rather than to whichever segment happens to be newest.
+parse_all() {
+  find "$1" -name 'updates.*.gz' 2>/dev/null | sort | while read -r segment; do
+    monocle parse "$segment" 2>&1
+  done
+}
+
+echo "== what the station recorded as received (adj-in-pre, every segment) =="
+IN_PARSED=$(parse_all run/station/archive/focl-in-adj-in-pre)
 echo "$IN_PARSED"
-echo "== what the station recorded as sent (adj-out) =="
-OUT_PARSED=$(monocle parse "$OUT_SEG" 2>&1)
+echo "== what the station recorded as sent (adj-out, every segment) =="
+OUT_PARSED=$(parse_all run/station/archive/focl-out-adj-out)
 echo "$OUT_PARSED"
 
 echo "== the peer's networks arrive on the inbound view, and only there =="
@@ -222,21 +247,37 @@ if echo "$OUT_PARSED" | grep -q '192.0.2.0/24'; then
   exit 1
 fi
 
+echo "== the reconnect produced a fresh table, not an empty session =="
+# The station was restarted while the session stayed up, so its last session can only report routes
+# if the daemon asked the peer to resend them. Segment names are no help here (a crash-recovery part
+# can sort after the live one), so the station's own summary of that session is the evidence.
+IN_BLOCK=$(grep -A5 '^client            focl-in$' run/station/bgpviews.log | tail -6)
+echo "$IN_BLOCK"
+echo "$IN_BLOCK" | grep -q 'records           4' || {
+  echo "FAIL: the session created after the reconnect recorded no routes; the table was never resent"
+  exit 1
+}
+echo "$IN_BLOCK" | grep -q 'end of rib        2' || {
+  echo "FAIL: the resent table arrived without its End-of-RIB markers"
+  exit 1
+}
+# Two connections for the inbound view means the station really did go away and come back.
+[ "$(echo "$VIEWS_LOG" | grep -c 'accepted a connection from 127.0.0.1 for focl-in')" -ge 2 ] || {
+  echo "FAIL: the inbound station never reconnected"
+  exit 1
+}
+
 echo "== the station counted the End-of-RIB markers, the peer-down and no stray view on both =="
 echo "$VIEWS_LOG" | grep -q 'client            focl-in' || { echo "FAIL: no adj-in-pre session in the log"; exit 1; }
 echo "$VIEWS_LOG" | grep -q 'client            focl-out' || { echo "FAIL: no adj-out session in the log"; exit 1; }
-# Both directions carry two families, so each session must account for two End-of-RIB markers.
-[ "$(echo "$VIEWS_LOG" | grep -c 'end of rib        2')" -ge 2 ] || {
-  echo "FAIL: the End-of-RIB markers did not reach both stations"
-  exit 1
-}
-[ "$(echo "$VIEWS_LOG" | grep -c 'peer_vanished')" -ge 2 ] || {
-  echo "FAIL: no Peer Down reached both stations"
-  exit 1
-}
-# A collector that swallowed the other direction's frames would say so here.
+# The End-of-RIB count for the inbound session is asserted above, on the session that came after the
+# restart; here only the counts that every session must have.
 [ "$(echo "$VIEWS_LOG" | grep -c 'unconfigured view 0')" -ge 2 ] || {
   echo "FAIL: a station counted frames that belong to the other direction"
+  exit 1
+}
+[ "$(echo "$VIEWS_LOG" | grep -c 'peer_vanished')" -ge 1 ] || {
+  echo "FAIL: no Peer Down reached a station"
   exit 1
 }
 

@@ -45,17 +45,32 @@ async fn main() -> Result<()> {
     // Validation guarantees `stations` is non-empty exactly when `[bmp].enabled` is set, so the
     // loop is also the check: a disabled section exports nothing.
     let mut bmp = Vec::with_capacity(cfg.bmp.stations.len());
+    // One channel for every inbound station: a reconnect of either one means the peers' tables are
+    // wanted, and the task that answers is shared so a burst of reconnects collapses into one
+    // request per peer.
+    let (redump_tx, redump_rx) = tokio::sync::mpsc::channel::<()>(4);
+    let mut wants_redump = false;
     for station in &cfg.bmp.stations {
         let resolved = station_settings(&cfg, station)?;
-        let handle = BmpExporter::spawn(BmpExportSettings {
-            station: resolved.address.clone(),
-            sys_name: cfg.bmp.sys_name.clone(),
-            sys_descr: cfg.bmp.sys_descr.clone(),
-            stats_interval_secs: cfg.bmp.stats_interval_secs,
-            peers: resolved.peers,
-            queue: cfg.bmp.queue_frames,
-            rib_out: station.rib_out,
-        })?;
+        let signal = if station.rib_out || !station.redump_on_connect {
+            None
+        } else {
+            wants_redump = true;
+            Some(redump_tx.clone())
+        };
+        let handle = BmpExporter::spawn(
+            BmpExportSettings {
+                station: resolved.address.clone(),
+                sys_name: cfg.bmp.sys_name.clone(),
+                sys_descr: cfg.bmp.sys_descr.clone(),
+                stats_interval_secs: cfg.bmp.stats_interval_secs,
+                peers: resolved.peers,
+                queue: cfg.bmp.queue_frames,
+                rib_out: station.rib_out,
+                redump_on_connect: station.redump_on_connect,
+            },
+            signal,
+        )?;
         tracing::info!(
             station = %resolved.address,
             rib_out = station.rib_out,
@@ -66,6 +81,12 @@ async fn main() -> Result<()> {
         bmp.push(handle);
     }
     let bgp = BgpService::new_with_sinks(&cfg, events_tx, Some(Arc::clone(&archive)), bmp).await?;
+    if wants_redump {
+        bgp.spawn_station_redump_task(
+            redump_rx,
+            std::time::Duration::from_secs(cfg.bmp.redump_cooldown_secs),
+        );
+    }
     // The speaker is the archive's RIB view source: a snapshot reads the live
     // Adj-RIB-In from the service that owns it.
     archive.set_snapshot_source(Arc::new(bgp.clone()));

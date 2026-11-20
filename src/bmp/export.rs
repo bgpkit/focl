@@ -49,6 +49,9 @@ pub struct BmpExportSettings {
     /// `true` for what we sent them (Adj-RIB-Out, RFC 8671). One connection carries one of them,
     /// because a station records one view per connection.
     pub rib_out: bool,
+    /// Ask the peers to resend their tables when this station connects while they are already up,
+    /// so a station that attached late gets a baseline instead of starting from changes only.
+    pub redump_on_connect: bool,
 }
 
 impl BmpExportSettings {
@@ -218,7 +221,13 @@ pub struct BmpExporter;
 
 impl BmpExporter {
     /// Spawns the exporting task and returns the handle session loops use.
-    pub fn spawn(settings: BmpExportSettings) -> Result<ExportHandle> {
+    ///
+    /// `on_connect` is signalled once per connection that found peers already up: that is the case
+    /// where the station has no baseline and the daemon can ask for a table.
+    pub fn spawn(
+        settings: BmpExportSettings,
+        on_connect: Option<mpsc::Sender<()>>,
+    ) -> Result<ExportHandle> {
         let station: SocketAddr = settings
             .station
             .parse()
@@ -234,7 +243,7 @@ impl BmpExporter {
             settings: settings.clone(),
             lagging: lagging.clone(),
         };
-        tokio::spawn(async move { run(station, settings, live, lagging, rx).await });
+        tokio::spawn(async move { run(station, settings, live, lagging, rx, on_connect).await });
         Ok(handle)
     }
 }
@@ -245,6 +254,7 @@ async fn run(
     live: std::sync::Arc<std::sync::Mutex<HashMap<String, LivePeer>>>,
     lagging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut rx: mpsc::Receiver<Item>,
+    on_connect: Option<mpsc::Sender<()>>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -252,7 +262,16 @@ async fn run(
             Ok(mut stream) => {
                 backoff = Duration::from_secs(1);
                 debug!(%station, "bmp: connected");
-                if let Err(error) = pump(&mut stream, &settings, &live, &lagging, &mut rx).await {
+                if let Err(error) = pump(
+                    &mut stream,
+                    &settings,
+                    &live,
+                    &lagging,
+                    &mut rx,
+                    on_connect.as_ref(),
+                )
+                .await
+                {
                     debug!(%station, %error, "bmp: session ended");
                 }
             }
@@ -277,6 +296,7 @@ async fn pump(
     live: &std::sync::Mutex<HashMap<String, LivePeer>>,
     lagging: &std::sync::atomic::AtomicBool,
     rx: &mut mpsc::Receiver<Item>,
+    on_connect: Option<&mpsc::Sender<()>>,
 ) -> Result<()> {
     // Peers announced on this connection, with the header each one needs.
     let mut announced: HashMap<String, PeerHeader> = HashMap::new();
@@ -299,9 +319,22 @@ async fn pump(
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
     };
+    let attached_late = !snapshot.is_empty();
+    debug!(
+        peers = snapshot.len(),
+        station = %settings.station,
+        "bmp: peer snapshot at connect"
+    );
     for (key, peer) in snapshot {
         announce(stream, &peer).await?;
         announced.insert(key, peer.peer);
+    }
+    if attached_late {
+        // The station is describing peers whose tables it never saw. Ask the daemon to have them
+        // resend, which is the only way a baseline can appear without keeping a spool of every PDU.
+        if let (true, Some(signal)) = (settings.redump_on_connect, on_connect) {
+            let _ = signal.try_send(());
+        }
     }
 
     let stats_interval = Duration::from_secs(settings.stats_interval_secs.max(1));
@@ -403,6 +436,7 @@ mod tests {
             peers: vec![],
             queue: 64,
             rib_out: false,
+            redump_on_connect: false,
         }
     }
 
@@ -464,7 +498,7 @@ mod tests {
     async fn a_connection_opens_with_initiation_then_the_peers_frames() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let station = listener.local_addr().unwrap();
-        let handle = BmpExporter::spawn(settings(&station.to_string())).unwrap();
+        let handle = BmpExporter::spawn(settings(&station.to_string()), None).unwrap();
 
         let (mut stream, _) = listener.accept().await.unwrap();
         let initiation = read_frames(&mut stream, 1).await;
@@ -506,7 +540,7 @@ mod tests {
     async fn a_peer_closed_after_announcement_gets_a_peer_down() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let station = listener.local_addr().unwrap();
-        let handle = BmpExporter::spawn(settings(&station.to_string())).unwrap();
+        let handle = BmpExporter::spawn(settings(&station.to_string()), None).unwrap();
         let (mut stream, _) = listener.accept().await.unwrap();
         let _ = read_frames(&mut stream, 1).await;
 
@@ -538,7 +572,7 @@ mod tests {
         let station = listener.local_addr().unwrap();
         let mut cfg = settings(&station.to_string());
         cfg.peers = vec!["198.51.100.1".to_string()];
-        let handle = BmpExporter::spawn(cfg).unwrap();
+        let handle = BmpExporter::spawn(cfg, None).unwrap();
         assert!(handle.exports("198.51.100.1"));
         assert!(!handle.exports("198.51.100.2"));
         handle.peer_up(
@@ -560,7 +594,7 @@ mod tests {
         let station = listener.local_addr().unwrap();
         let mut cfg = settings(&station.to_string());
         cfg.rib_out = true;
-        let handle = BmpExporter::spawn(cfg).unwrap();
+        let handle = BmpExporter::spawn(cfg, None).unwrap();
         let (mut stream, _) = listener.accept().await.unwrap();
         let _ = read_frames(&mut stream, 1).await;
 
@@ -596,6 +630,6 @@ mod tests {
 
     #[test]
     fn a_station_that_is_not_host_port_is_refused_before_the_daemon_runs() {
-        assert!(BmpExporter::spawn(settings("not-a-socket")).is_err());
+        assert!(BmpExporter::spawn(settings("not-a-socket"), None).is_err());
     }
 }

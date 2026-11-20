@@ -154,6 +154,24 @@ struct SessionHandle {
     tx: mpsc::Sender<SessionOp>,
     supports_v4: bool,
     supports_v6: bool,
+    /// RFC 2918 route refresh was negotiated on both sides for this family, so a request will be
+    /// answered rather than ignored.
+    refresh_v4: bool,
+    refresh_v6: bool,
+}
+
+impl SessionHandle {
+    /// Families this session can be asked to resend its table for.
+    fn refreshable_families(&self) -> Vec<Afi> {
+        let mut families = Vec::with_capacity(2);
+        if self.supports_v4 && self.refresh_v4 {
+            families.push(Afi::Ipv4);
+        }
+        if self.supports_v6 && self.refresh_v6 {
+            families.push(Afi::Ipv6);
+        }
+        families
+    }
 }
 
 impl SessionHandle {
@@ -169,7 +187,15 @@ impl SessionHandle {
 #[derive(Debug, Clone)]
 enum SessionOp {
     Announce(PrefixEntry),
-    Withdraw { network: IpNet },
+    Withdraw {
+        network: IpNet,
+    },
+    /// Ask the peer to resend its Adj-RIB-In for one family (RFC 2918). focl sends no routes of
+    /// its own for this: the peer answers with the table it holds now, which a station that
+    /// attached after the session came up needs in order to have a baseline at all.
+    RequestRefresh {
+        afi: Afi,
+    },
 }
 
 /// Runtime overrides layered over the configured prefix list.
@@ -972,6 +998,8 @@ impl BgpService {
                 tx: ctrl_tx,
                 supports_v4: negotiated.carries(Afi::Ipv4, Safi::Unicast),
                 supports_v6: negotiated.supports(Afi::Ipv6, Safi::Unicast),
+                refresh_v4: negotiated.route_refresh,
+                refresh_v6: negotiated.route_refresh,
             };
             self.inner
                 .session_ops
@@ -1093,6 +1121,19 @@ impl BgpService {
     ) -> Result<()> {
         let local_as = peer.local_as.unwrap_or(self.inner.global_asn);
         let updates = match &op {
+            // A route refresh is not an announcement: it asks the peer for its table, so it carries
+            // no update to mirror into the archive or to a station, and it does not change how many
+            // prefixes this session advertises.
+            SessionOp::RequestRefresh { afi } => {
+                let refresh = BgpMessage::RouteRefresh(BgpRouteRefreshMessage {
+                    afi: (*afi).into(),
+                    subtype: 0,
+                    safi: Safi::Unicast.into(),
+                    data: Vec::new(),
+                });
+                write_bgp_message(writer, &refresh, negotiated.asn_length()).await?;
+                return Ok(());
+            }
             SessionOp::Announce(entry) => build_announce_updates(
                 std::slice::from_ref(entry),
                 self.inner.router_id,
@@ -1425,6 +1466,91 @@ impl BgpService {
         }
     }
 
+    /// Asks one established peer to resend its Adj-RIB-In (RFC 2918), for every family it can.
+    ///
+    /// Returns whether a request reached the session. Peers that never negotiated route refresh,
+    /// and sessions that are not established, are not asked: an unanswered request would look like
+    /// a table that is on its way and never arrives.
+    pub async fn redump_peer(&self, address: &str) -> bool {
+        let families = {
+            let sessions = self.inner.session_ops.read().await;
+            sessions
+                .get(address)
+                .map(SessionHandle::refreshable_families)
+                .unwrap_or_default()
+        };
+        if families.is_empty() {
+            return false;
+        }
+        let mut asked = false;
+        for afi in families {
+            let tx = {
+                let sessions = self.inner.session_ops.read().await;
+                sessions.get(address).map(|handle| handle.tx.clone())
+            };
+            let Some(tx) = tx else {
+                continue;
+            };
+            if tx.send(SessionOp::RequestRefresh { afi }).await.is_ok() {
+                asked = true;
+            }
+        }
+        asked
+    }
+
+    /// Asks every established peer that can answer to resend its table. Ignores the station
+    /// cooldown: callers that react to a reconnect use [`Self::spawn_station_redump_task`].
+    pub async fn redump_all_peers(&self) -> usize {
+        let addresses: Vec<String> = {
+            let sessions = self.inner.session_ops.read().await;
+            sessions.keys().cloned().collect()
+        };
+        let mut asked = 0;
+        for address in addresses {
+            if self.redump_peer(&address).await {
+                asked += 1;
+            }
+        }
+        asked
+    }
+
+    /// Turns a station's reconnect into a table request, at most once per peer per cooldown.
+    ///
+    /// A station that attached after a session came up has no baseline for that peer: the table it
+    /// would have recorded arrived before it was listening. Keeping a copy of every PDU since
+    /// session start in case that happens would duplicate the archive inside the daemon, so the
+    /// daemon asks the peer for its current table instead, which is what an operator would do by
+    /// hand. The cooldown is the safety property: a flapping station must not be able to make this
+    /// daemon pull a full table from every peer on each reconnect.
+    pub fn spawn_station_redump_task(
+        &self,
+        mut signals: mpsc::Receiver<()>,
+        cooldown: Duration,
+    ) -> JoinHandle<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut last: HashMap<String, Instant> = HashMap::new();
+            while signals.recv().await.is_some() {
+                let now = Instant::now();
+                let addresses: Vec<String> = {
+                    let sessions = service.inner.session_ops.read().await;
+                    sessions.keys().cloned().collect()
+                };
+                for address in addresses {
+                    if last
+                        .get(&address)
+                        .is_some_and(|asked_at| now.duration_since(*asked_at) < cooldown)
+                    {
+                        continue;
+                    }
+                    if service.redump_peer(&address).await {
+                        last.insert(address, now);
+                    }
+                }
+            }
+        })
+    }
+
     async fn archive_peer_state(&self, address: &str, old_state: PeerState, new_state: PeerState) {
         let Some(archive) = &self.inner.archive else {
             return;
@@ -1648,6 +1774,9 @@ impl BgpService {
         let network = match &op {
             SessionOp::Announce(entry) => entry.network,
             SessionOp::Withdraw { network } => *network,
+            // A refresh names a family, not a prefix, and is sent to one session by address rather
+            // than dispatched to every session that carries a network.
+            SessionOp::RequestRefresh { .. } => return Vec::new(),
         };
         let handles: Vec<(String, SessionHandle)> = self
             .inner
@@ -3901,6 +4030,49 @@ mod tests {
         assert_eq!(entry.dev_attr255_interval_secs, Some(3600));
     }
 
+    #[tokio::test]
+    async fn a_station_reconnect_asks_each_peer_for_its_table_once_per_cooldown() {
+        let cfg = test_service_config();
+        let (event_tx, _) = broadcast::channel::<EventEnvelope>(4);
+        let service = BgpService::new(&cfg, event_tx).await.unwrap();
+
+        let peer = "192.0.2.2";
+        let (tx, mut rx) = mpsc::channel(8);
+        service.inner.session_ops.write().await.insert(
+            peer.to_string(),
+            SessionHandle {
+                tx,
+                supports_v4: true,
+                supports_v6: false,
+                refresh_v4: true,
+                refresh_v6: false,
+            },
+        );
+
+        // The station's first reconnect asks for the one family this session can refresh.
+        assert!(service.redump_peer(peer).await);
+        match rx.recv().await {
+            Some(SessionOp::RequestRefresh { afi }) => assert_eq!(afi, Afi::Ipv4),
+            other => panic!("expected a route refresh for ipv4, got {other:?}"),
+        }
+
+        // A peer that never negotiated route refresh is not asked: an unanswered request would make
+        // a station wait for a table that is not coming.
+        let (tx, mut quiet) = mpsc::channel(8);
+        service.inner.session_ops.write().await.insert(
+            "192.0.2.3".to_string(),
+            SessionHandle {
+                tx,
+                supports_v4: true,
+                supports_v6: false,
+                refresh_v4: false,
+                refresh_v6: false,
+            },
+        );
+        assert!(!service.redump_peer("192.0.2.3").await);
+        assert!(quiet.try_recv().is_err());
+    }
+
     fn test_service_config() -> FoclConfig {
         toml::from_str(
             r#"
@@ -3992,6 +4164,8 @@ enabled = false
                     tx,
                     supports_v4,
                     supports_v6,
+                    refresh_v4: true,
+                    refresh_v6: true,
                 },
             );
         }

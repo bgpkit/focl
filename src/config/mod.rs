@@ -49,6 +49,10 @@ pub struct BmpConfig {
     /// a gap, rather than losing frames silently or stalling a BGP session.
     #[serde(default = "default_bmp_queue")]
     pub queue_frames: usize,
+    /// Shortest interval between two table requests for the same peer. A station that reconnects in
+    /// a loop must not be able to make this daemon ask its peers for a full table each time.
+    #[serde(default = "default_bmp_redump_cooldown")]
+    pub redump_cooldown_secs: u64,
 }
 
 impl Default for BmpConfig {
@@ -60,6 +64,7 @@ impl Default for BmpConfig {
             sys_descr: default_bmp_sys_descr(),
             stats_interval_secs: default_bmp_stats_interval(),
             queue_frames: default_bmp_queue(),
+            redump_cooldown_secs: default_bmp_redump_cooldown(),
         }
     }
 }
@@ -79,6 +84,11 @@ pub struct BmpStationConfig {
     /// peer that comes up.
     #[serde(default)]
     pub peers: Vec<String>,
+    /// When this station connects while peers are already up, ask those peers to resend their
+    /// tables (RFC 2918), so the station records a baseline instead of starting from changes only.
+    /// Ignored on a `rib_out` connection, which carries no tables to rebuild.
+    #[serde(default = "default_true")]
+    pub redump_on_connect: bool,
 }
 
 fn default_bmp_sys_name() -> String {
@@ -95,6 +105,10 @@ fn default_bmp_stats_interval() -> u64 {
 
 fn default_bmp_queue() -> usize {
     65_536
+}
+
+fn default_bmp_redump_cooldown() -> u64 {
+    300
 }
 
 impl FoclConfig {
@@ -152,6 +166,21 @@ impl FoclConfig {
         }
         if self.bmp.queue_frames == 0 {
             bail!("[bmp].queue_frames must be at least 1");
+        }
+        if self.bmp.redump_cooldown_secs == 0 {
+            bail!("[bmp].redump_cooldown_secs must be at least 1; a station that flaps must not pull a table on every reconnect");
+        }
+        for station in &self.bmp.stations {
+            if station.rib_out && station.redump_on_connect {
+                // An outbound connection describes what this daemon sends; there is no table for the
+                // station to rebuild, so the setting would silently ask peers for transfers nobody
+                // needs.
+                bail!(
+                    "[[bmp.stations]] {} sets redump_on_connect with rib_out = true; an Adj-RIB-Out \
+                     connection has no table to rebuild",
+                    station.address
+                );
+            }
         }
         for station in &self.bmp.stations {
             for wanted in &station.peers {

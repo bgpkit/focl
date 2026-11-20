@@ -42,6 +42,28 @@ outbound policy, so its Adj-RIB-Out is already post-policy). Peer Up, Peer Down 
 Reports keep `O` clear: RFC 8671 has receivers ignore it there and requires it zero on a
 Statistics Report.
 
+## Reconnecting: the station asks, the peer answers
+
+A station that attaches while sessions are already up has no baseline: the tables it would have
+recorded arrived before it was listening, and focl kept no copy of them. Rather than spooling every
+PDU in case that happens (which duplicates the archive inside the daemon, and would have to reach
+back to session start to be correct), focl asks the peers for their tables again: one ROUTE-REFRESH
+per family (RFC 2918), whose answer arrives as ordinary UPDATEs and is forwarded verbatim, End-of-RIB
+included.
+
+* It happens when a station connects and at least one peer is already established, which is exactly
+  the case with no baseline.
+* It needs route refresh negotiated in both directions; a peer that never offered it is not asked,
+  because a request nobody answers leaves the station waiting for a table that is not coming.
+* It is rate limited per peer (`[bmp].redump_cooldown_secs`, default 300 s): a station in a
+  reconnect loop must not be able to make this daemon pull a full table from every peer each time.
+* It applies to inbound connections only. An Adj-RIB-Out connection describes what this daemon sends
+  and has no table to rebuild, so pairing it with `redump_on_connect` is a configuration error.
+
+The cost is one table transfer per reconnect event. For a peer with a full table that is tens of
+megabytes; the alternative, a station with no baseline for that peer, cannot be repaired later
+because BMP has no way to ask for a table after the fact.
+
 ## Configuration
 
 ```toml
@@ -50,11 +72,13 @@ enabled = true
 sys_name = "focl-edge01"       # what the station records as this feed's identity
 stats_interval_secs = 60       # shorter than any idle timeout on the path
 queue_frames = 65536           # frames that may wait before the session is dropped
+redump_cooldown_secs = 300     # shortest interval between two table requests for one peer
 
 # What the peers sent us.
 [[bmp.stations]]
 address = "203.0.113.20:1790"   # the station's address; focl dials
 peers = ["edge-router"]        # optional: peer names or addresses; empty exports them all
+# redump_on_connect = true     # default: ask peers to resend when this station attaches late
 
 # What we sent them. A separate connection, because the station records one view per port.
 [[bmp.stations]]
@@ -88,12 +112,9 @@ updates_interval_minutes = 1
 
 ## What it does not do, and why
 
-* **No table replay after a reconnect.** focl does not keep the raw PDUs of a peer's initial table,
-  so a station that attaches while a session is already up receives Peer Up and then live changes.
-  The interval before the reconnect is a hole, and the honest thing is to leave it visible: the
-  station's own coverage record shows the peer without a baseline. Synthesising the table from
-  focl's RIB would be worse than the hole, because the RIB holds only next hop, AS path and origin,
-  and a station cannot tell a reconstructed path from an observed one.
+* **No synthesized tables.** focl never rebuilds a table from its RIB for a station: the RIB holds
+  only next hop, AS path and origin, and a station cannot tell a reconstructed path from an observed
+  one. When a table is needed again it is asked for on the wire, as "Reconnecting" describes.
 * **No pre-policy Adj-RIB-Out.** The `L` flag is always set on an outbound frame because focl
   transmits everything it builds, so there is no pre-policy stage to describe.
 * **No Route Mirroring, no add-path marking.** The station decides what it can accept from the
